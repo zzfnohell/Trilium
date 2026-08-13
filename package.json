@@ -23,6 +23,8 @@
     "standalone:build": "pnpm run --filter standalone build",
     "standalone:test": "pnpm run --filter standalone test",
     "mobile:sync": "pnpm run --filter mobile sync",
+    "tauri:start": "pnpm run --filter tauri dev",
+    "tauri:build": "pnpm run --filter tauri build",
     "desktop:start-prod-no-dir": "pnpm run --filter desktop start-prod-no-dir",
     "edit-docs:edit-docs": "pnpm run --filter edit-docs edit-docs",
     "edit-docs:build": "pnpm run --filter edit-docs build",

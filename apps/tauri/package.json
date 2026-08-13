@@ -1,0 +1,12 @@
+{
+  "name": "@triliumnext/tauri",
+  "version": "0.104.1",
+  "description": "Trilium Notes Tauri shell (POC) — Rust sidecar around the existing server",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "dev": "cargo run --manifest-path src-tauri/Cargo.toml",
+    "build": "cargo build --manifest-path src-tauri/Cargo.toml --release",
+    "check": "cargo check --manifest-path src-tauri/Cargo.toml"
+  }
+}
