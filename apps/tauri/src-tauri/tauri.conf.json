@@ -7,16 +7,6 @@
     "frontendDist": "../frontend"
   },
   "app": {
-    "windows": [
-      {
-        "title": "Trilium Notes — Tauri POC",
-        "width": 1280,
-        "height": 840,
-        "minWidth": 800,
-        "minHeight": 600,
-        "url": "http://localhost:8080"
-      }
-    ],
     "security": {
       "csp": null
     }
