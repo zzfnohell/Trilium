@@ -1557,7 +1557,8 @@
     "editor_crashed_details_intro": "If you experience this error several times, consider reporting it on GitHub by pasting the information below.",
     "editor_crashed_details_title": "Technical information",
     "auto-detect-language": "Auto-detected",
-    "keeps-crashing": "Editing component keeps crashing. Please try restarting Trilium. If problem persists, consider creating a bug report."
+    "keeps-crashing": "Editing component keeps crashing. Please try restarting Trilium. If problem persists, consider creating a bug report.",
+    "nothing_selected_to_cut": "Select some text first to cut it into a sub-note."
   },
   "empty": {
     "open_note_instruction": "Open a note by typing the note's title into the input below or choose a note in the tree.",
@@ -1744,7 +1745,12 @@
     "failed": "Sync failed: {{message}}"
   },
   "database": {
-    "title": "Database"
+    "title": "Database",
+    "start_over_description": "Switch to a new blank database, start again syncing with a new server or restore a backup. You will be prompted to backup your data before discarding the existing data.",
+    "start_over": "Start over",
+    "start_over_confirm": "Trilium will go back to the setup screen, where you can start a new knowledge base, restore a backup or sync from another device. You will be offered a backup of your current data first, and nothing is deleted until you choose one of those. Continue?",
+    "start_over_pending": "The setup screen will appear the next time this server is restarted. Restart the server when you are ready, or cancel below to leave everything as it is.",
+    "start_over_cancel": "Cancel start over"
   },
   "vacuum_database": {
     "title": "Vacuum Database",
@@ -2323,7 +2329,7 @@
     "title": "Spell Check",
     "description": "These options apply only for desktop builds, browsers will use their own native spell check.",
     "enable": "Check spelling",
-    "disabled_placeholder": "Spell check is turned off. Enable it to choose languages and manage the custom dictionary.",
+    "enable_description": "Underlines misspelled words as you type, with corrections offered in the right-click menu.",
     "language_code_label": "Spell Check Languages",
     "custom_dictionary_title": "Custom Dictionary",
     "custom_dictionary_description": "Words added to the dictionary are synced across all your devices.",
@@ -2742,7 +2748,8 @@
     "backend_scripting_disabled_more_info": "More info"
   },
   "ws": {
-    "sync-check-failed": "Sync check failed!",
+    "sync-hash-check-failed-title": "Sync stopped",
+    "sync-hash-check-failed": "This database and the sync server hold data that could not be reconciled by re-syncing it ({{- sectors}}).\n\nSyncing will keep failing until this is resolved. See the logs for details.",
     "consistency-checks-failed": "Consistency checks failed! See logs for details.",
     "encountered-error": "Encountered error \"{{message}}\", check out the console.",
     "lost-websocket-connection-title": "Lost connection to the server",
@@ -3199,7 +3206,9 @@
     "content_hints_enabled": "Content hints",
     "content_hints_description": "Show short hints in the bottom corner of the editor that explain how to interact with the element under the caret or pointer.",
     "auto_link_previews_enabled": "Autogenerate link previews",
-    "auto_link_previews_description": "Automatically turn a detected link into a preview showing the title, description and image of the web page. Inserting a preview from the toolbar always works, regardless of this setting."
+    "auto_link_previews_description": "Automatically turn a detected link into a preview showing the title, description and image of the web page. Inserting a preview from the toolbar always works, regardless of this setting.",
+    "html_support_enabled": "Preserve unsupported HTML tags",
+    "html_support_description": "Keep the HTML tags that the editor has no feature of its own for, as listed under Options → Other → HTML import tags. They appear as blocks that cannot be edited directly, and an unrecognised tag may not be visible at all while editing. With this off, such tags are dropped from a note the first time it is edited and saved; importing is unaffected either way."
   },
   "table_view": {
     "new-row": "New row",
@@ -3664,6 +3673,7 @@
     "create-new-document-options-empty-description": "Start with a blank knowledge base. You can import demo notes later.",
     "create-new-document-title": "Preparing your knowledge base",
     "create-new-document-description": "This will only take a moment.",
+    "create-new-document-failed": "Your knowledge base could not be created",
     "sync-illustration-this-device": "This device",
     "sync-illustration-desktop-app": "Your desktop app",
     "sync-illustration-server": "Your server",
@@ -3697,8 +3707,8 @@
     "your-ip-addresses": "Addresses for this device",
     "existing-data": "Save your existing data?",
     "existing-data-back-up": "Yes, create a backup",
-    "existing-data-delete": "No, delete everything",
-    "existing-data-delete-warning": "Once you press Continue, the existing knowledge base is permanently erased. There is no way to recover it afterwards.",
+    "existing-data-skip": "No, continue without a backup",
+    "existing-data-skip-warning": "Nothing is deleted yet. Your knowledge base is only replaced once you choose to create a new one, restore a backup or sync from another device.",
     "existing-data-cancel": "Cancel",
     "existing-data-backing-up": "Backing up",
     "existing-data-backing-up-message": "Creating a backup...",
@@ -3731,11 +3741,13 @@
     "backup-downloaded": "The download has completed. Press \"Finish\" to return to the application.",
     "backup-download-failed": "The download did not finish.",
     "backup-finish": "Finish",
-    "existing-data-erase-confirm": "Now the existing data will be discarded. Make sure you keep the backup file somewhere safe. Continue?",
-    "existing-data-delete-failed": "The existing knowledge base could not be deleted.",
+    "existing-data-erase-confirm": "Your existing knowledge base will now be permanently deleted, so that this device can receive one from your desktop app. Make sure you have a backup somewhere safe. Continue?",
+    "unlock-refused": "Those details were not accepted. Please try again.",
+    "keep-existing": "Return to the app",
+    "keep-existing-description": "Keep using your existing knowledge base and go back to the app.",
     "existing-data-keep-failed": "The existing knowledge base could not be reopened.",
     "restore-from-backup": "Restore from backup",
-    "restore-from-backup-description": "Continue using an existing knowledge base, restored from a backup file.",
+    "restore-from-backup-description": "Start using a knowledge base restored from a backup file.",
     "restore-from-backup-page-description": "Choose the backup to restore from.",
     "restore-existing-backups": "Existing backups",
     "restore-looking-for-backups": "Looking for backups...",
@@ -3837,7 +3849,8 @@
     "direction-down": "Branches downwards"
   },
   "llm": {
-    "disabled_placeholder": "AI features are turned off. Enable them to configure providers and MCP.",
+    "enabled": "AI features",
+    "enabled_description": "Adds the AI chat sidebar and LLM chat notes, using the providers configured below.",
     "feature_not_enabled": "Enable the LLM experimental feature in Settings → Advanced → Experimental features to use AI integrations.",
     "add_provider": "Add Provider",
     "add_provider_title": "Add AI Provider",

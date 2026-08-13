@@ -1,4 +1,4 @@
-import { DISPLAYABLE_LOCALE_IDS, IMAGE_MIMES, LOCALES } from "@triliumnext/commons";
+import { DISPLAYABLE_LOCALE_IDS, IMAGE_MIMES, LOCALES, SANITIZER_DEFAULT_ALLOWED_TAGS } from "@triliumnext/commons";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import imageService from "../../../services/image.js";
@@ -215,6 +215,88 @@ describe("CK config", () => {
             ?.katexRenderOptions?.macros;
         // Without this mapping, MathLive's \differentialD renders as raw error text (issue #9523).
         expect(macros?.["\\differentialD"]).toBe("\\mathrm{d}");
+    });
+});
+
+describe("CK config - HTML support", () => {
+    // The feature ships off, so everything below the first two tests describes what an install that
+    // has opted back in gets.
+    beforeEach(() => {
+        optionsState.map.textNoteHtmlSupportEnabled = "true";
+    });
+
+    it("keeps GHS out of the way until the user opts in", async () => {
+        optionsState.map.textNoteHtmlSupportEnabled = "false";
+        optionsState.map.allowedHtmlTags = JSON.stringify(SANITIZER_DEFAULT_ALLOWED_TAGS);
+
+        const config = await buildConfig(baseOpts());
+
+        // The allow-list is emptied rather than narrowed: GHS decides per element, so there is no
+        // subset of the option that still means anything once the feature is off. The tag list goes
+        // on governing what the server-side sanitizer accepts on import.
+        expect(config.htmlSupport?.allow).toEqual([]);
+    });
+
+    it("treats an unset option as off, the way the shipped default is", async () => {
+        // An install predating the option has no row for it, and must not silently run with GHS on.
+        delete optionsState.map.textNoteHtmlSupportEnabled;
+        optionsState.map.allowedHtmlTags = JSON.stringify(SANITIZER_DEFAULT_ALLOWED_TAGS);
+
+        const config = await buildConfig(baseOpts());
+
+        expect(config.htmlSupport?.allow).toEqual([]);
+    });
+
+    it("names every allowed tag rather than handing GHS bare strings", async () => {
+        optionsState.map.allowedHtmlTags = JSON.stringify(["p", "section", "en-media"]);
+
+        const config = await buildConfig(baseOpts());
+
+        // The shape is the whole point: `DataFilter#loadAllowedConfig` falls back to a
+        // match-everything pattern for an entry with no `name`, so a list of plain strings allowed
+        // every element — including the `$customElement` catch-all, which round-tripped unknown tags
+        // as opaque blobs that were invisible and un-navigable in the editing view (#10989).
+        expect(config.htmlSupport?.allow).toEqual([
+            { name: "p", attributes: true, classes: true, styles: true },
+            { name: "section", attributes: true, classes: true, styles: true },
+            { name: "en-media", attributes: true, classes: true, styles: true }
+        ]);
+        // Nothing is disallowed outright; the allow-list alone decides.
+        expect(config.htmlSupport?.disallow).toBeUndefined();
+    });
+
+    it("allows nothing beyond the natively supported elements when the list is empty", async () => {
+        const config = await buildConfig(baseOpts());
+
+        expect(config.htmlSupport?.allow).toEqual([]);
+    });
+
+    it("withholds div from the editor even when the option allows it", async () => {
+        // GHS gives div a dual content model — a paragraph impostor around inline content, an
+        // affordance-less container around a block — which is what strands the caret in a wrapped
+        // code block. Unwrapping it is the point; the sanitizer reads the same option and is
+        // deliberately left accepting div on import.
+        optionsState.map.allowedHtmlTags = JSON.stringify(["div", "p", "section"]);
+
+        const config = await buildConfig(baseOpts());
+
+        expect(config.htmlSupport?.allow).toEqual([
+            { name: "p", attributes: true, classes: true, styles: true },
+            { name: "section", attributes: true, classes: true, styles: true }
+        ]);
+    });
+
+    it("withholds div from the shipped default list too", async () => {
+        // The default is what nearly every install runs with, so the filter has to bite there
+        // rather than only on a hand-edited list.
+        optionsState.map.allowedHtmlTags = JSON.stringify(SANITIZER_DEFAULT_ALLOWED_TAGS);
+
+        const config = await buildConfig(baseOpts());
+
+        const names = (config.htmlSupport?.allow ?? []).map((pattern) => (pattern as { name: string }).name);
+        expect(names).not.toContain("div");
+        // Everything else the default list names still comes through.
+        expect(names).toEqual(SANITIZER_DEFAULT_ALLOWED_TAGS.filter((tag) => tag !== "div"));
     });
 });
 

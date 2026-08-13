@@ -27,8 +27,19 @@ export * from "./services/sql/index";
 export { default as sql_init } from "./services/sql_init";
 export { getRunningSetupOperation, holdSetup, withSetupLock } from "./services/setup_lock";
 export {
+    authenticateSetup,
+    initSetupSecondFactor,
+    isSetupAuthorized,
+    isSetupAuthRequired,
+    isSetupSecondFactorRequired,
+    resetSetupAuth,
+    type SetupSecondFactor
+} from "./services/setup_auth";
+export {
+    enterSetupMode,
     getSetupLanguage,
     getSetupTargetScreen,
+    hasExistingData,
     isInitialSetup,
     isSetupRequested,
     leaveSetupMode,
@@ -138,7 +149,7 @@ export { inspectImage, type InspectedImage, UNKNOWN_FORMAT } from "./services/im
 export { type CoreConfig, initConfig, getConfig } from "./services/config";
 export { default as imageService } from "./services/image";
 export { t } from "i18next";
-export type { RequestProvider, ExecOpts, CookieJar, FetchResourceOpts, FetchedResource } from "./services/request";
+export type { RequestProvider, ExecOpts, CookieJar, FetchApiOpts, FetchResourceOpts, FetchedResource } from "./services/request";
 export type * from "./meta";
 export * as routeHelpers from "./routes/helpers";
 

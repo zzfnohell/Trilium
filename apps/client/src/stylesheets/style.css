@@ -664,7 +664,7 @@ button.btn-sm {
     color: var(--left-pane-text-color);
 }
 
-.ck.ck-block-toolbar-button {
+.ck.ck-button.ck-block-toolbar-button {
     transform: translateX(7px);
     color: var(--muted-text-color);
     background-color: var(--main-background-color);
@@ -672,6 +672,8 @@ button.btn-sm {
     min-width: 0;
     padding: 0;
     z-index: 1000;
+    translate: -40% 0;
+    padding: 0;
 }
 
 body[dir=rtl] .ck.ck-block-toolbar-button {
@@ -1093,13 +1095,16 @@ code {
 
 .ck-content code:not(pre code) {
     padding: 0.1em 0.35em;
-    border: 1px solid var(--inline-code-border-color);
     border-radius: 5px;
     background-color: var(--inline-code-background-color);
     /* Monospace runs visually larger than the surrounding prose at the same nominal size. */
-    font-size: 0.9em;
+    font-size: 0.8em;
     /* A long path or identifier must wrap rather than push the paragraph past the note width. */
     overflow-wrap: break-word;
+
+    &.ck-code_selected {
+        background-color: var(--inline-code-hover-background-color) !important;
+    }
 }
 
 .animated {
@@ -3136,6 +3141,8 @@ iframe.print-iframe {
        variant — this makes both variants share one deterministic geometry. */
     position: absolute;
     top: calc((1lh - var(--_checkbox-size)) / 2);
+    inset-inline-start: -25px;
+    inset-inline-end: auto;
     /* `1lh` must resolve against the text's line height, not the UA form-control
        font, and the UA's 3px checkbox margins would offset the absolute position.
        (Bootstrap's reboot happens to do both, but don't depend on it.) */
