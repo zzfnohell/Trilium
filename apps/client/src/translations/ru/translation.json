@@ -45,7 +45,11 @@
     },
     "widget-missing-parent": "В пользовательском виджете не определено обязательное свойство '{{property}}'.\n\nЕсли этот скрипт предназначен для запуска без элемента пользовательского интерфейса, используйте '#run=frontendStartup'.",
     "open-script-note": "Открыть заметку со скриптом",
-    "scripting-error": "Ошибка пользовательского скрипта: {{title}}"
+    "scripting-error": "Ошибка пользовательского скрипта: {{title}}",
+    "unhandled-error": {
+      "details-button": "Подробнее...",
+      "details-title": "Техническая информация"
+    }
   },
   "add_link": {
     "add_link": "Добавить ссылку",
@@ -57,7 +61,9 @@
     "search_note": "поиск заметки по ее названию",
     "link_title_mirrors": "название ссылки отражает текущий заголовок заметки",
     "anchor": "Якорь (необязательно)",
-    "anchor_none": "Нет (ссылка на заметку)"
+    "anchor_none": "Нет (ссылка на заметку)",
+    "edit_link": "Редактировать",
+    "button_edit_link": "Сохранить"
   },
   "branch_prefix": {
     "save": "Сохранить",
@@ -282,7 +288,8 @@
     "export": "Экспорт",
     "choose_export_type": "Сначала выберите тип экспорта",
     "export_finished_successfully": "Экспорт завершился успешно.",
-    "format_pdf": "PDF - для печати или обмена."
+    "format_pdf": "PDF - для печати или обмена.",
+    "what_to_export": "Что экспортировать"
   },
   "help": {
     "noteNavigation": "Навигация по заметке",
@@ -548,7 +555,8 @@
     "other_notes_with_name": "Другие заметки с {{attributeType}} названием \"{{attributeName}}\"",
     "textarea": "Многострочный текст",
     "print_scale": "При экспорте в PDF меняет масштаб содержимого. Значения от 0.1 (10%) до 2 (200%), по умолчанию 1 (100%).",
-    "print_margins": "При экспорте в PDF задаёт поля страницы. Используйте <code>default</code>, <code>none</code>, <code>minimum</code> или собственные значения в формате <code>top,right,bottom,left</code> в миллиметрах."
+    "print_margins": "При экспорте в PDF задаёт поля страницы. Используйте <code>default</code>, <code>none</code>, <code>minimum</code> или собственные значения в формате <code>top,right,bottom,left</code> в миллиметрах.",
+    "no_other_notes": "Только эта заметка"
   },
   "command_palette": {
     "configure_launch_bar_description": "Откройте конфигурацию панели запуска, чтобы добавить или удалить элементы.",
@@ -1084,9 +1092,7 @@
     "open_all_confirm_one": "Это откроет заметки ({{count}}) в новых вкладках. Продолжить?",
     "open_all_confirm_few": "",
     "open_all_confirm_many": "",
-    "open_all_too_one": "Слишком много результатов ({{count}}). Максимум — {{max}}.",
-    "open_all_too_few": "Слишком много результатов ({{count}}). Максимум — {{max}}.",
-    "open_all_too_many": "Слишком много результатов ({{count}}). Максимум — {{max}}."
+    "open_all_limit_exceeded": "Слишком много результатов ({{count}}). Максимум — {{max}}."
   },
   "edited_notes": {
     "deleted": "(удалено)",
@@ -1940,7 +1946,6 @@
     "cut": "Заметки вырезаны в буфер обмена."
   },
   "ws": {
-    "sync-check-failed": "Проверка синхронизации не удалась!",
     "encountered-error": "Обнаружена ошибка \"{{message}}\", проверьте консоль.",
     "consistency-checks-failed": "Проверка целостности не пройдена! Подробности смотрите в логах.",
     "lost-websocket-connection-title": "Потеряно соединение с сервером",
@@ -2268,8 +2273,6 @@
     "rotate": "Повернуть",
     "picture-in-picture": "Картинка в картинке",
     "exit-picture-in-picture": "Выйти из «картинки в картинке»",
-    "fullscreen": "Полноэкранный режим (F)",
-    "exit-fullscreen": "Выйти из полноэкранного режима",
     "unsupported-format": "Предпросмотр недоступен для этого формата файлов:\n{{mime}}",
     "zoom-to-fit": "Растянуть на весь экран",
     "zoom-reset": "Сбросить масштаб"
@@ -2419,7 +2422,13 @@
     "math": "Вставить блок с математической формулой",
     "footnote": "Вставить сноску",
     "mermaid": "Вставить диаграмму Mermaid",
-    "admonition": "Вставить блок-выноску ({{type}})"
+    "admonition": "Вставить блок-выноску ({{type}})",
+    "placeholders": {
+      "math": "уравнение",
+      "collapsible_summary": "Содержание",
+      "collapsible_details": "Детали",
+      "table_column": "Столбец {{number}}"
+    }
   },
   "revisions": {
     "note_revisions": "Версии заметки",
@@ -2561,58 +2570,6 @@
     "page_ranges_invalid": "Неверный формат. Используйте, например, 1-5, 8, 11-13.",
     "page_ranges_placeholder": "например, 1-5, 8, 11-13"
   },
-  "setup": {
-    "heading": "Знакомство с Trilium",
-    "new-document": "Новая база знаний",
-    "new-document-description": "Создайте чистую базу знаний и сразу приступайте к работе.",
-    "sync-from-desktop": "Подключить настольное приложение",
-    "sync-from-desktop-description": "У вас есть только настольное приложение Trilium на другом устройстве. Это устройство будет синхронизировать данные с него.",
-    "sync-from-server": "Подключиться к существующему серверу",
-    "sync-from-server-description": "У вас где-то запущен сервер Trilium (на своём хосте или в облаке). Это устройство будет синхронизировать данные с него.",
-    "next": "Далее",
-    "init-in-progress": "Идёт инициализация базы знаний",
-    "redirecting": "Сейчас вы будете перенаправлены в приложение.",
-    "title": "Настройка",
-    "sync-from-server-page-description": "Введите данные вашего сервера, чтобы подключиться к существующему рабочему пространству.",
-    "sync-in-progress-title": "Идёт синхронизация",
-    "sync-in-progress-description": "Устройство подключено, идёт синхронизация данных.",
-    "sync-in-progress-banner": "Это может занять время, в зависимости от объёма заметок. Не переключайтесь на другие приложения, пока синхронизация не завершится.",
-    "button-back": "Назад",
-    "button-finish-setup": "Завершить настройку",
-    "sync-step-connecting": "Подключение к серверу",
-    "sync-step-syncing": "Синхронизация данных",
-    "sync-step-finalizing": "Применение настроек",
-    "create-new-document-options-title": "С чего хотите начать?",
-    "create-new-document-options-with-demo": "С демо-содержимым",
-    "create-new-document-options-with-demo-description": "Изучите возможности Trilium на демонстрационных заметках.",
-    "create-new-document-options-empty": "Пустая база",
-    "create-new-document-options-empty-description": "Начать с чистой базы знаний. Демо-заметки можно импортировать позже.",
-    "create-new-document-title": "Подготовка вашей базы знаний",
-    "create-new-document-description": "Это займёт всего минуту.",
-    "sync-illustration-this-device": "Это устройство",
-    "sync-illustration-desktop-app": "Ваше настольное приложение",
-    "sync-illustration-server": "Ваш сервер",
-    "sync-from-desktop-step1": "Откройте настольный экземпляр Trilium Notes.",
-    "sync-from-desktop-step2": "В меню Trilium выберите «Параметры».",
-    "sync-from-desktop-step3": "В дереве заметок откройте раздел «Синхронизация».",
-    "sync-from-desktop-step4": "Укажите адрес сервера, выбрав один из адресов справа, и нажмите «Сохранить».",
-    "sync-from-desktop-step5": "Нажмите «Проверить синхронизацию», чтобы убедиться, что соединение работает.",
-    "sync-from-desktop-warning": "Убедитесь, что оба устройства находятся в одной сети.",
-    "sync-from-desktop-waiting": "Ожидание подключения...",
-    "advanced-options": "Расширенные параметры",
-    "sync-failed": "Не удалось синхронизировать: {{message}}",
-    "server-host": "Адрес сервера Trilium",
-    "server-host-placeholder": "https://<hostname>:<port>",
-    "server-password": "Пароль",
-    "proxy-server": "Прокси-сервер (необязательно)",
-    "proxy-server-placeholder": "https://<hostname>:<port>",
-    "proxy-instruction": "Если оставить параметр прокси пустым, будет использован системный прокси.",
-    "dismiss-error": "Скрыть ошибку",
-    "wrong-password": "Неверный пароль. Попробуйте ещё раз.",
-    "language": "Язык",
-    "continue": "Продолжить",
-    "your-ip-addresses": "Сетевые адреса этого устройства"
-  },
   "common": {
     "save": "Сохранить",
     "cancel": "Отмена"
@@ -2635,5 +2592,33 @@
       "right-click-or-press-0-to-change-state": "Щелкните правой кнопкой мыши, чтобы просмотреть другие состояния задачи.\nНажмите %0 для переключения между состояниями.",
       "undefined-custom-task-state": "Неопределеннре пользовательское состояние задачи"
     }
+  },
+  "onenote_import": {
+    "import_count_one": "Импортировать {{count}} раздел",
+    "import_count_few": "Импортировать {{count}} раздела",
+    "import_count_many": "Импортировать {{count}} разделов",
+    "attach_source": "Добавить оригинальный HTML (отладка)"
+  },
+  "notion_import": {
+    "import": "Импорт"
+  },
+  "keep_import": {
+    "import": "Импорт"
+  },
+  "anytype_import": {
+    "import": "Импорт"
+  },
+  "obsidian_import": {
+    "import": "Импорт"
+  },
+  "evernote_import": {
+    "import": "Импорт"
+  },
+  "attribute_list_panel": {
+    "delete_confirm": "Удалить атрибут \"{{name}}\"?",
+    "no_value": "Нет значения"
+  },
+  "convert_note": {
+    "choose_conversion": "(выбрать конвертацию)"
   }
 }

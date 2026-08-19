@@ -17,7 +17,7 @@
     "@excalidraw/excalidraw": "0.18.1",
     "@mermaid-js/layout-elk": "0.2.2",
     "@popperjs/core": "2.11.8",
-    "@preact/signals": "2.11.0",
+    "@preact/signals": "2.11.1",
     "@sqlite.org/sqlite-wasm": "3.51.1-build2",
     "@triliumnext/backup-container": "workspace:*",
     "@triliumnext/ckeditor5": "workspace:*",
@@ -48,7 +48,7 @@
     "js-sha512": "0.9.0",
     "scrypt-js": "3.0.1",
     "jsplumb": "2.15.6",
-    "katex": "0.18.3",
+    "katex": "0.18.4",
     "maplibre-gl": "5.24.0",
     "mark.js": "8.11.1",
     "marked": "18.0.9",
@@ -62,7 +62,7 @@
     "reveal.js": "6.0.1",
     "svg-pan-zoom": "3.6.2",
     "tabulator-tables": "6.5.2",
-    "temporal-polyfill": "1.0.3"
+    "temporal-polyfill": "1.0.4"
   },
   "devDependencies": {
     "@types/aes-js": "3.1.4",

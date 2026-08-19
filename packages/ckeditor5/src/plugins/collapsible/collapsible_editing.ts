@@ -141,6 +141,8 @@ export default class CollapsibleEditing extends Plugin {
         this.registerConversion();
         this.registerBodyPlaceholder();
         this.registerKeyHandlers();
+        this.registerMergeGuard();
+        this.registerHiddenMergeReveal();
         this.registerClickHandler();
         this.registerDomListeners();
         this.registerPostFixers();
@@ -538,7 +540,11 @@ export default class CollapsibleEditing extends Plugin {
         this.listenTo<ViewDocumentArrowKeyEvent>(viewDocument, "arrowKey",
             (evt, data) => this.onUpArrow(evt, data));
         this.listenTo<ViewDocumentDeleteEvent>(viewDocument, "delete",
+            (evt, data) => this.onDeleteThroughHiddenBody(evt, data), { priority: "high" });
+        this.listenTo<ViewDocumentDeleteEvent>(viewDocument, "delete",
             (evt, data) => this.onDeleteAdjacentDetails(evt, data));
+        this.listenTo<ViewDocumentDeleteEvent>(viewDocument, "delete",
+            (evt, data) => this.onForwardDeleteBeforeDetails(evt, data));
         this.listenTo<ViewDocumentDeleteEvent>(viewDocument, "delete",
             (evt, data) => this.onBackspaceInEmptySummary(evt, data), { context: "summary" });
     }
@@ -702,6 +708,46 @@ export default class CollapsibleEditing extends Plugin {
     }
 
     /**
+     * Drop a browser-supplied delete range that reaches through a collapsed body.
+     *
+     * Chrome derives the target range of `deleteContentBackward` from the rendered
+     * layout, where a closed <details> shows nothing but its title. Backspace at the
+     * start of the line below one therefore arrives as a range running from the end of
+     * the <summary> to the caret, and CKEditor's `Delete` removes every hidden block in
+     * between — the collapsible stays closed, so the loss is invisible. Clearing the
+     * range falls back to the model-driven `modifySelection` path, which walks the model
+     * rather than the layout: it merges into the last body block, and
+     * {@link CollapsibleEditing#hiddenBodyPostFixer} then parks the caret in the summary.
+     *
+     * Only a collapsed model selection is corrected. A range the user selected by hand
+     * can legitimately span a collapsed block (dragging from before it to after it), and
+     * deleting that is what they asked for.
+     */
+    private onDeleteThroughHiddenBody(_evt: any, data: any) {
+        if (data.unit !== "selection") return;
+        if (!this.editor.model.document.selection.isCollapsed) return;
+
+        const mapper = this.editor.editing.mapper;
+        for (const viewRange of data.selectionToRemove.getRanges()) {
+            if (!this.crossesCollapsedBoundary(mapper.toModelRange(viewRange))) continue;
+            data.unit = "codePoint";
+            data.selectionToRemove = undefined;
+            return;
+        }
+    }
+
+    /** True when a collapsed <details> holds one end of the range but not the other. */
+    private crossesCollapsedBoundary(range: any): boolean {
+        const startAncestors = range.start.getAncestors();
+        const endAncestors = range.end.getAncestors();
+        for (const node of [...startAncestors, ...endAncestors]) {
+            if (!node.is("element", "details") || this.isDetailsOpen(node)) continue;
+            if (startAncestors.includes(node) !== endAncestors.includes(node)) return true;
+        }
+        return false;
+    }
+
+    /**
      * Two-step delete next to a <details> (matches CKEditor's widget/object pattern):
      *   1st press: select the whole <details> so the user sees what's about to go.
      *   2nd press: with the details selected, default delete removes it.
@@ -739,6 +785,119 @@ export default class CollapsibleEditing extends Plugin {
         data.preventDefault();
         evt.stop();
         /* v8 ignore stop */
+    }
+
+    /**
+     * Forward Delete from an empty block sitting directly before a collapsible: drop the
+     * block and put the caret at the start of the title.
+     *
+     * That is the same outcome CKEditor's own merge was reaching for, minus the merge —
+     * which {@link CollapsibleEditing#registerMergeGuard} keeps away from a <details>,
+     * so without this handler the keystroke would do nothing at all. A plain remove plus
+     * a selection change converts correctly.
+     */
+    private onForwardDeleteBeforeDetails(evt: any, data: any) {
+        if (data.direction !== "forward") return;
+        const selection = this.editor.model.document.selection;
+        if (!selection.isCollapsed) return;
+        const block = selection.getFirstPosition()?.parent;
+        if (!block || !block.is("element") || !block.isEmpty) return;
+        const details = block.nextSibling;
+        if (!details?.is("element", "details")) return;
+        const summary = details.getChild(0);
+        /* v8 ignore next -- a <details> always holds a <summary> as its first child by the time this runs */
+        if (!summary?.is("element", "summary")) return;
+
+        data.preventDefault();
+        evt.stop();
+
+        this.editor.model.change(writer => {
+            writer.setSelection(summary, 0);
+            // An empty <summary> is a title, not a blank line the user wants gone:
+            // removing it would only make the summary-invariant post-fixer put a fresh
+            // one back, so there the caret move is the whole effect.
+            if (!block.is("element", "summary")) {
+                writer.remove(block);
+            }
+        });
+    }
+
+    /**
+     * Keep `deleteContent` from merging a block into a <details>.
+     *
+     * When a deletion leaves its start block empty, CKEditor merges *right*: the empty
+     * block is moved into the <details> that holds the end of the range, renamed to
+     * `summary`, and the old title merged into it. The resulting model is correct; the
+     * editing view is not. Reconverting a <details> re-slots its children's existing view
+     * elements instead of converting them again, so a child moved in during the same
+     * change block keeps the element name and the content it had before the move — the
+     * collapsible renders with no <summary> at all (a bare native "Details" marker) and
+     * the next caret move throws `mapping-model-offset-not-found`. This is reachable from
+     * every path that deletes across the boundary: Delete on a blank line above a
+     * collapsible, a selection running from there into the title or body, and typing or
+     * pasting over such a selection.
+     *
+     * `leaveUnmerged` skips `mergeBranches` only, so the selected content is still
+     * deleted — the emptied block simply stays put instead of being folded into the
+     * collapsible. Merges in the other direction are left alone: when content survives in
+     * the start block, or the range runs out of a collapsible rather than into one,
+     * CKEditor merges left and the element it moves is the one it then removes, so nothing
+     * stale is left behind to re-slot.
+     */
+    private registerMergeGuard() {
+        this.listenTo(this.editor.model, "deleteContent", (_evt, args: any[]) => {
+            const [selection, options] = args;
+            const range = selection.getFirstRange();
+            /* v8 ignore next -- deleteContent bails on a collapsed selection before this fires */
+            if (!range) return;
+            // Content survives in the start block → CKEditor merges left, which converts fine.
+            if (!range.start.isAtStart) return;
+            // Nothing is moved into a <details> unless the range ends inside one that does
+            // not already hold its start.
+            const details = range.end.findAncestor("details");
+            if (!details || range.start.getAncestors().includes(details)) return;
+            args[1] = { ...options, leaveUnmerged: true };
+        }, { priority: "high" });
+    }
+
+    /**
+     * Expand a collapsed collapsible that a deletion is about to merge content into.
+     *
+     * Backspace at the start of the line below a closed block merges that line into the
+     * last body block, which is hidden: the text leaves the screen with no sign of where
+     * it went. Opening the block first keeps the result in view. The expansion runs on the
+     * deletion's own batch, so a single Ctrl+Z takes back both the merge and the reveal —
+     * the same reasoning as the mid-title split in
+     * {@link CollapsibleEditing#onEnterInSummary}.
+     *
+     * Scoped to deletions that actually carry something in. A blank line below the block
+     * merges nothing, so it is removed with the block left closed, and Backspace on a blank
+     * line keeps meaning "drop this line" rather than "open the block below".
+     *
+     * Registered after {@link CollapsibleEditing#registerMergeGuard} so it sees the options
+     * that guard rewrites: `leaveUnmerged` means nothing is folded in and nothing needs
+     * revealing.
+     */
+    private registerHiddenMergeReveal() {
+        this.listenTo(this.editor.model, "deleteContent", (_evt, args: any[]) => {
+            const [selection, options] = args;
+            if (options?.leaveUnmerged) return;
+            const range = selection.getFirstRange();
+            /* v8 ignore next -- deleteContent bails on a collapsed selection before this fires */
+            if (!range) return;
+            // Content is folded in only when the range starts inside a collapsible and ends
+            // outside it — the direction CKEditor merges left.
+            const details = range.start.findAncestor("details");
+            if (!details || this.isDetailsOpen(details)) return;
+            if (range.end.getAncestors().includes(details)) return;
+            // Whatever trails the range's end is what gets carried across. Nothing trailing,
+            // nothing to see.
+            if (range.end.isAtEnd) return;
+
+            // A nested change joins the batch already open around `deleteContent`, keeping
+            // the reveal on the same undo step as the merge.
+            this.editor.model.change(writer => writer.setAttribute(OPEN_ATTRIBUTE, true, details));
+        }, { priority: "high" });
     }
 
     /** Backspace at start of an empty summary unwraps the collapsible. */

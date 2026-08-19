@@ -49,6 +49,12 @@ export interface ProviderType {
      * headed "Cloud providers", is a line of height for nothing.
      */
     description?: string;
+    /**
+     * What the connection step shows when the provider has neither a key nor an
+     * endpoint to ask for: the full account-and-prerequisite story, in place of
+     * the fields that would otherwise fill the step.
+     */
+    connectionDescription?: string;
     /** One-line setup reminder shown under the endpoint field (i18n key, rendered via `<Trans>`). */
     setupHintKey?: string;
     /** Marks the provider as beta, shown as a badge next to its name. */
@@ -93,7 +99,7 @@ export interface ProviderType {
  */
 const PROVIDER_GROUPS = [
     { id: "cloud", columns: 2, headingKey: "llm.provider_group_cloud", descriptionKey: "llm.provider_group_cloud_description" },
-    { id: "subscription", columns: 1, headingKey: "llm.provider_group_subscription", descriptionKey: "llm.provider_group_subscription_description" },
+    { id: "subscription", columns: 2, headingKey: "llm.provider_group_subscription", descriptionKey: "llm.provider_group_subscription_description" },
     { id: "local", columns: 2, headingKey: "llm.provider_group_local", descriptionKey: "llm.provider_group_local_description" },
     // Kept apart from the local runtimes: the same card reaches a hosted
     // OpenAI-compatible service (OpenRouter, Groq, …), so neither "no usage cost"
@@ -113,7 +119,10 @@ export const PROVIDER_TYPES: ProviderType[] = [
     { id: "deepseek", name: "DeepSeek", group: "cloud", defaultBaseUrl: "https://api.deepseek.com/v1", iconUrl: PROVIDER_ICONS.deepseek, beta: true },
     // Uses the Claude Agent SDK on the server; auth belongs to Claude Code (`claude /login`),
     // and usage is covered by the subscription rather than charged per token.
-    { id: "claude-agent", name: "Claude Code", group: "subscription", defaultBaseUrl: "", iconUrl: PROVIDER_ICONS["claude-agent"], description: t("llm.provider_desc_claude_agent"), beta: true, apiKey: "none", baseUrl: "none", needsHostProcess: true },
+    { id: "claude-agent", name: "Claude Code", group: "subscription", defaultBaseUrl: "", iconUrl: PROVIDER_ICONS["claude-agent"], description: t("llm.provider_desc_claude_agent"), connectionDescription: t("llm.claude_agent_description"), beta: true, apiKey: "none", baseUrl: "none", needsHostProcess: true },
+    // The same arrangement over the GitHub Copilot CLI, driven in its ACP mode;
+    // auth belongs to the CLI (`copilot login`).
+    { id: "copilot-agent", name: "GitHub Copilot", group: "subscription", defaultBaseUrl: "", iconUrl: PROVIDER_ICONS["copilot-agent"], description: t("llm.provider_desc_copilot_agent"), connectionDescription: t("llm.copilot_agent_description"), beta: true, apiKey: "none", baseUrl: "none", needsHostProcess: true },
     // The three self-hosted cards share one server-side provider; they differ only in
     // the endpoint they prefill and the setup hint they show.
     // No blurbs: the group heading already says local/self-hosted, and how to start
@@ -138,7 +147,11 @@ export const PROVIDER_TYPES: ProviderType[] = [
     }
 ];
 
-function isValidBaseUrl(value: string): boolean {
+/**
+ * Whether an endpoint is one the app could actually reach. An empty field is not invalid — it means
+ * the provider's own default stands — so it is only the shape of what was typed that is judged here.
+ */
+export function isValidBaseUrl(value: string): boolean {
     if (!value) {
         return true;
     }
@@ -148,6 +161,29 @@ function isValidBaseUrl(value: string): boolean {
     } catch {
         return false;
     }
+}
+
+/**
+ * Whether the connection step has been given everything the provider needs of it: a key where one is
+ * required, an endpoint where the provider has no default of its own, and nothing malformed in the
+ * endpoint field either way.
+ *
+ * Both fields are taken as typed; the trimming is done here so a field of spaces counts as empty.
+ */
+export function isConnectionValid(providerType: ProviderType | undefined, apiKey: string, baseUrl: string): boolean {
+    const apiKeyMode = providerType?.apiKey ?? "required";
+    const baseUrlMode = providerType?.baseUrl ?? "advanced";
+    const trimmedBaseUrl = baseUrl.trim();
+
+    if (apiKeyMode === "required" && !apiKey.trim()) {
+        return false;
+    }
+
+    if (baseUrlMode === "none") {
+        return true;
+    }
+
+    return isValidBaseUrl(trimmedBaseUrl) && (baseUrlMode !== "required" || !!trimmedBaseUrl);
 }
 
 /**
@@ -193,8 +229,7 @@ export default function AddProviderModal({ show, onHidden, onSave, existingProvi
     const trimmedApiKey = apiKey.trim();
     const trimmedBaseUrl = baseUrl.trim();
     const baseUrlIsValid = isValidBaseUrl(trimmedBaseUrl);
-    const connectionValid = (apiKeyMode !== "required" || !!trimmedApiKey)
-        && (baseUrlMode === "none" || (baseUrlIsValid && (baseUrlMode !== "required" || !!trimmedBaseUrl)));
+    const connectionValid = isConnectionValid(providerType, apiKey, baseUrl);
 
     /**
      * Picking a card swaps in that provider's endpoint — so the right port is
@@ -341,7 +376,7 @@ export default function AddProviderModal({ show, onHidden, onSave, existingProvi
                             )}
                             {baseUrlMode === "advanced" && baseUrlField}
                             {!usesApiKey && baseUrlMode === "none" && (
-                                <p>{t("llm.claude_agent_description")}</p>
+                                <p>{providerType?.connectionDescription}</p>
                             )}
                         </CardSection>
                     </Card>

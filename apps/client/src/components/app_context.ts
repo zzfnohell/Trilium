@@ -128,6 +128,7 @@ export type CommandMappings = {
     showOptions: CommandData & {
         section?: string;
     };
+    showContentLanguagesDialog: CommandData;
     showExportDialog: CommandData & {
         notePath: string;
         defaultType: "single" | "subtree";
@@ -343,6 +344,7 @@ export type CommandMappings = {
     };
     showSQLConsole: CommandData;
     showBackendLog: CommandData;
+    showSpaceUsage: CommandData;
     showCheatsheet: CommandData;
     showShortcutHints: CommandData;
     showHelp: CommandData;
@@ -671,6 +673,8 @@ export class AppContext extends Component {
         if (utils.isElectron()) {
             this.child(zoomComponent);
         }
+
+        void keyboardActionsService.setupWindowShortcuts();
     }
 
     renderWidgets() {
