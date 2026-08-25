@@ -3,10 +3,53 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Trilium Notes — Tauri POC</title>
+    <title>Trilium Notes — Tauri IPC slice</title>
+    <style>
+      body { font-family: ui-monospace, Menlo, Consolas, monospace; padding: 16px; }
+      button { margin-right: 8px; padding: 6px 12px; }
+      #out { white-space: pre-wrap; background: #f4f4f4; border: 1px solid #ddd;
+             margin-top: 12px; padding: 8px; min-height: 40px; }
+      #events { white-space: pre-wrap; margin-top: 8px; color: #065f46; }
+    </style>
   </head>
   <body>
-    <p>Trilium Tauri POC shell. The window loads the Trilium client from the
-    locally running server at <code>http://localhost:8080</code>.</p>
+    <h3>Trilium Tauri — IPC 垂直切片</h3>
+    <button onclick="runBootstrap()">invoke bootstrap</button>
+    <button onclick="runPing()">invoke ping_test (发事件)</button>
+    <div id="out">(invoke 返回结果)</div>
+    <div id="events">(frontend-update 事件)</div>
+
+    <script type="module">
+      // Tauri v2 JS API。此 build 未开启 withGlobalTauri 全局注入，故经 ESM 引入。
+      // 测试页从 CDN 拉取仅为本地 smoke 验证；后续接入真实 client 时改用打包器。
+      import { invoke } from "https://esm.sh/@tauri-apps/api@2/core";
+      import { listen } from "https://esm.sh/@tauri-apps/api@2/event";
+
+      const out = document.getElementById("out");
+      const events = document.getElementById("events");
+
+      // 订阅 Rust 端广播的 frontend-update 事件 —— 替代原 ws.ts 的 WS 通道
+      listen("frontend-update", (event) => {
+        events.textContent = "event: " + JSON.stringify(event.payload) + "\n" + events.textContent;
+      });
+
+      window.runBootstrap = async function () {
+        try {
+          const data = await invoke("bootstrap");
+          out.textContent = JSON.stringify(data, null, 2);
+        } catch (err) {
+          out.textContent = "error: " + err;
+        }
+      };
+
+      window.runPing = async function () {
+        try {
+          const result = await invoke("ping_test");
+          out.textContent = "ping_test -> " + result;
+        } catch (err) {
+          out.textContent = "error: " + err;
+        }
+      };
+    </script>
   </body>
 </html>
