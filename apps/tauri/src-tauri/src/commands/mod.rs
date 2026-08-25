@@ -3,4 +3,6 @@
 //! what the client fetched over HTTP (`/bootstrap`, `/api/notes/...`) becomes
 //! an `invoke()` call here.
 
+pub mod api;
 pub mod bootstrap;
+pub mod ws;

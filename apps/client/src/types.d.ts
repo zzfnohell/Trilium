@@ -37,6 +37,21 @@ interface CustomGlobals extends BootstrapDefinition {
 
 type RequireMethod = (moduleName: string) => any;
 
+/**
+ * The Tauri shell injects `window.electronApi.ipc` (see apps/tauri main.rs) so the
+ * client can route the REST contract over Tauri IPC instead of HTTP. The real
+ * Electron shell has no such `ipc` member — it reaches the backend over HTTP — so
+ * this is an optional widening of the shared `ElectronApi` contract rather than a
+ * field on it.
+ */
+interface TauriIpcBridge {
+    invoke<T = unknown>(command: string, args?: Record<string, unknown>): Promise<T>;
+}
+
+interface TauriIpcBridgeHolder {
+    ipc?: TauriIpcBridge;
+}
+
 declare global {
     interface Window {
         $: JQueryStatic;
@@ -61,7 +76,7 @@ declare global {
             getPlatform?: () => string;
         };
 
-        electronApi?: ElectronApi;
+        electronApi?: ElectronApi & TauriIpcBridgeHolder;
         /** Present only in the standalone build, where the stack runs in this browser. */
         standaloneApi?: StandaloneApi;
     }

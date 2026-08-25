@@ -34,8 +34,12 @@ async function initJQuery() {
 }
 
 async function setupGlob() {
-    const response = await fetch(`./bootstrap${window.location.search}`);
-    const json = await response.json();
+    // Desktop (Electron/Tauri) shells fetch the bootstrap over IPC instead of HTTP: the page
+    // lives on a custom protocol with no server behind it. The bridge is injected before this
+    // module runs, so `window.electronApi` is already present here when in a shell.
+    const json = window.electronApi?.ipc
+        ? await window.electronApi.ipc.invoke("bootstrap")
+        : await fetch(`./bootstrap${window.location.search}`).then((response) => response.json());
 
     window.global = globalThis; /* fixes https://github.com/webpack/webpack/issues/10035 */
     window.glob = {

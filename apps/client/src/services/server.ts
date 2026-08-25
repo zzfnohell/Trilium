@@ -209,7 +209,57 @@ async function call<T>(method: string, url: string, componentId?: string, option
     return resp.body as T;
 }
 
+/**
+ * Returns `true` when the app runs inside a desktop shell (Electron or Tauri)
+ * whose bridge exposes `window.electronApi.ipc`. Such shells serve the REST
+ * contract over IPC instead of HTTP, so every request is routed through the
+ * `api` command rather than a `$.ajax` call.
+ */
+function isDesktopShell(): boolean {
+    return Boolean(window.electronApi?.ipc);
+}
+
+/**
+ * Desktop-shell transport for {@link ajax}. The Rust `api` command answers every
+ * route with an HTTP-style `{ status, body }` wrapper; this maps 2xx to a
+ * resolved response and any other status through the same silent/error handling
+ * the HTTP path uses, so callers behave identically in both transports.
+ */
+async function ajaxViaIpc(url: string, method: string, data: unknown, opts: CallOptions): Promise<Response> {
+    const payload: Record<string, unknown> = { method, url };
+    if (data !== undefined) {
+        payload.data = data;
+    }
+
+    const invoke = window.electronApi?.ipc?.invoke;
+    if (!invoke) {
+        throw "desktop shell reached ajax without an ipc bridge";
+    }
+    const resp = (await invoke("api", payload)) as { status: number; body: unknown };
+    const responseText = typeof resp.body === "string" ? resp.body : JSON.stringify(resp.body ?? "");
+
+    if (resp.status >= 200 && resp.status < 300) {
+        return { body: resp.body, headers: {} };
+    }
+
+    if (!(opts.silentNotFound && resp.status === 404) && !(opts.silentInternalServerError && resp.status === 500) && !(opts.silentUnauthorized && resp.status === 401)) {
+        try {
+            await reportError(method, url, resp.status, responseText);
+        } catch {
+            // reportError may throw (e.g. ValidationError); ensure the rejection still happens below.
+        }
+    }
+    throw responseText;
+}
+
 function ajax(url: string, method: string, data: unknown, headers: Headers, opts: CallOptions): Promise<Response> {
+    // In a desktop shell there is no HTTP server behind the page; the Rust backend
+    // serves the same REST contract over Tauri IPC. Route requests through it, then
+    // fall through to the jQuery path for the browser build (trilium standalone/web).
+    if (isDesktopShell()) {
+        return ajaxViaIpc(url, method, data, opts);
+    }
+
     return new Promise((res, rej) => {
         const options: JQueryAjaxSettings = {
             url: window.glob.baseApiUrl + url,

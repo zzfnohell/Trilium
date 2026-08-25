@@ -4,9 +4,12 @@
   "version": "0.104.1",
   "identifier": "com.triliumnext.notes.poc",
   "build": {
-    "frontendDist": "../frontend"
+    "frontendDist": "../../client/dist",
+    "beforeBuildCommand": "pnpm client:build",
+    "beforeDevCommand": "pnpm client:build"
   },
   "app": {
+    "withGlobalTauri": true,
     "security": {
       "csp": null
     }
