@@ -66,8 +66,15 @@ fn dispatch(conn: &rusqlite::Connection, method: &str, url: &str, data: &Option<
     };
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-    // Write routes are not implemented yet — refuse them explicitly rather than
-    // pretending a write happened.
+    // The write path so far is a single route: editing a note's data.
+    if method == "PUT" {
+        return match segments.as_slice() {
+            ["notes", note_id, "data"] => put_note_data(conn, note_id, data),
+            _ => Err(not_found(&format!("No route for PUT {url}"))),
+        };
+    }
+
+    // All other methods are unhandled — refuse them explicitly rather than pretending a write happened.
     if method != "GET" {
         return Err(not_found("non-GET routes not implemented yet"));
     }
@@ -153,9 +160,33 @@ fn parse_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|pair| pair.split_once('=').filter(|(k, _)| *k == name).map(|(_, v)| v))
 }
 
+/// `PUT /notes/{id}/data` — the edit-save write path. Routes to the faithful sync
+/// write and returns the (empty) body the real route produces.
+fn put_note_data(conn: &rusqlite::Connection, note_id: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+    let content = data
+        .as_ref()
+        .and_then(|v| v.get("content"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad_request("Missing or invalid 'content' in payload"))?;
+
+    db::write::update_note_data(conn, note_id, content).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+
+    Ok(json!({}))
+}
+
 fn not_found(message: &str) -> ApiError {
     ApiError {
         status: 404,
+        message: message.to_string(),
+    }
+}
+
+fn bad_request(message: &str) -> ApiError {
+    ApiError {
+        status: 400,
         message: message.to_string(),
     }
 }

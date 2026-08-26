@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 pub mod tree;
+pub mod write;
 
 /// Directory name that holds the Trilium data files (matches `DIR_NAME` in the server).
 const DATA_DIR_NAME: &str = "trilium-data";
