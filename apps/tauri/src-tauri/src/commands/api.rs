@@ -100,6 +100,13 @@ fn dispatch(conn: &rusqlite::Connection, method: &str, url: &str, data: &Option<
             "buildDate": "",
             "buildTime": ""
         })),
+        // The number of (non-deleted) notes. `note_autocomplete` awaits this at
+        // module scope during boot — the client builds no layout until boot
+        // finishes, so this route has to answer or the whole app stays blank.
+        ["autocomplete", "notesCount"] => get_notes_count(conn),
+        // Key bindings are decorative here (shortcuts are silent no-ops in the
+        // shell), but `keyboard_actions` expects a non-null array.
+        ["keyboard-actions"] => Ok(json!([])),
         _ => Err(not_found(&format!("No route for GET {url}"))),
     }
 }
@@ -158,6 +165,17 @@ fn parse_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query
         .split('&')
         .find_map(|pair| pair.split_once('=').filter(|(k, _)| *k == name).map(|(_, v)| v))
+}
+
+/// The total number of non-deleted notes, matching the real `getNotesCount`.
+fn get_notes_count(conn: &rusqlite::Connection) -> Result<Value, ApiError> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM notes WHERE isDeleted = 0;", [], |row| row.get(0))
+        .map_err(|err| ApiError {
+            status: 500,
+            message: format!("failed to count notes: {err}"),
+        })?;
+    Ok(json!(count))
 }
 
 /// `PUT /notes/{id}/data` — the edit-save write path. Routes to the faithful sync

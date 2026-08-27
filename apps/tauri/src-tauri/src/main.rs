@@ -50,24 +50,106 @@ const ELECTRON_BRIDGE_JS: &str = r#"
             }
         },
         window: {
+            // The client's desktop init path reads and writes the full ElectronWindowApi.window
+            // contract during startup (syncNativeWindowWithTheme, zoom, full-screen, window state).
+            // Absent methods throw a synchronous TypeError there, which aborts the desktop module
+            // evaluation and leaves the page stuck on the hidden body. Provide every method: writes
+            // are no-ops, reads return the value that keeps the local renderer on its defaults.
+            setZoomFactor: noop,
+            getZoomFactor: function () { return 1.0; },
+            setNativeThemeSource: noop,
+            setTitleBarOverlay: noop,
+            setWindowButtonPosition: noop,
+            onEnterFullScreen: noop,
+            onLeaveFullScreen: noop,
+            isFullScreen: function () { return false; },
+            setFullScreen: noop,
+            minimizeWindow: noop,
+            maximizeWindow: noop,
+            unmaximizeWindow: noop,
+            isMaximized: function () { return false; },
+            closeWindow: noop,
+            createExtraWindow: noop,
+            isAlwaysOnTop: function () { return false; },
+            setAlwaysOnTop: noop,
+            toggleDevTools: noop,
+            isDevToolsDocked: function () { return false; },
+            setBackgroundMaterial: noop,
+            setVibrancy: noop,
             reloadAllWindows: function(){ window.location.reload(); },
             restartApp: function(){ window.location.reload(); },
+            toggleAllWindows: noop,
+            clearCache: function () { return Promise.resolve(); },
+            showWindow: noop,
             reportStartupMetric: noop,
             onGlobalShortcut: noop,
             onOpenInSameTab: noop,
-            onEnterFullScreen: noop,
-            onLeaveFullScreen: noop,
-            isDevToolsDocked: function(){ return false; },
             onDevToolsDockChanged: noop
         },
         navigation: {
-            clearNavigationHistory: noop
-        },
+                    clearNavigationHistory: noop,
+                    // The tab history buttons call these synchronously during render; a missing
+                    // method throws "is not a function" and aborts the layout. There is no real
+                    // browser history in this shell — report that nothing can unwind.
+                    navigationCanGoBack: function () { return false; },
+                    navigationCanGoForward: function () { return false; },
+                    navigationGoToIndex: noop
+                },
+                contextMenu: {
+                    // The editor's native context menu wires itself to Electron's `contextMenu`.
+                    // There is no native menu here, so swallow the registration request.
+                    onContextMenu: noop
+                },
         systemIntegration: {
             reloadTray: noop,
             reapplyLaunchOnStartup: noop
         }
     };
+    // Forward renderer errors and unhandled rejections to the Rust side so they
+    // surface on the terminal — without an attached devtools console, the blank
+    // page case has no other way of reporting what failed.
+    function fwd(kind, message) {
+        try {
+            window.__TAURI__.core.invoke("log_frontend_error", { kind: kind, message: String(message).slice(0, 2000) });
+        } catch (e) {}
+    }
+    window.addEventListener("error", function (e) { fwd("error", (e && (e.message || (e.error && e.error.stack))) || "unknown error"); });
+    window.addEventListener("unhandledrejection", function (e) { fwd("unhandledrejection", (e && e.reason && e.reason.stack) || (e && e.reason) || "unknown rejection"); });
+    // Route the client's own reported failures (e.g. "Critical error occurred" on appContext.start)
+    // to the terminal too — the toast that carries them may itself fail to render on a blank page.
+    try {
+        var origError = console.error.bind(console);
+        console.error = function () {
+            origError.apply(null, arguments);
+            try { fwd("console-error", Array.prototype.map.call(arguments, String).join(" ").slice(0, 2000)); } catch (x) {}
+        };
+    } catch (e) {}
+    // Periodic renderer state dumps at a few ages — a single 4s snapshot says nothing about whether
+    // the desktop module (which imports note-autocomplete etc. over the network) finishes later.
+    function dumpState() {
+        try {
+            var kids = Array.prototype.slice.call(document.body.children || []);
+            var kidDesc = kids.slice(0, 8).map(function (k) { return k.tagName + "." + (k.className || "").toString().split(" ").slice(0,3).join("."); });
+            var links = Array.prototype.slice.call(document.querySelectorAll('link[rel=stylesheet]'));
+            var failing = links.filter(function (l) { return !(l.sheet && l.sheet.cssRules && l.sheet.cssRules.length > 0); });
+            fwd("state", JSON.stringify({
+                readyState: document.readyState,
+                bodyDisplay: document.body.style.display,
+                bodyChildren: kids.length,
+                kidDesc: kidDesc,
+                globSet: !!(window.glob && window.glob.theme),
+                links: links.length,
+                failingLinks: failing.map(function (l) { return l.href; }),
+                hasTree: !!document.querySelector('.tree, #left-pane, .note-tree'),
+                textLen: document.body.innerText.length,
+                hasCritical: !!document.querySelector('.toast-critical, .toast-persistent'),
+                sample: document.body.innerText.slice(0, 150)
+            }));
+        } catch (e) {}
+    }
+    window.setTimeout(dumpState, 3000);
+    window.setTimeout(dumpState, 8000);
+    window.setTimeout(dumpState, 15000);
 })();
 "#;
 
@@ -79,6 +161,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap::bootstrap,
             commands::bootstrap::ping_test,
+            commands::bootstrap::log_frontend_error,
             commands::api::api,
             commands::ws::ws_send
         ])

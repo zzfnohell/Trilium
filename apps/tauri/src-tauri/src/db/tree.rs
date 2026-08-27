@@ -241,7 +241,12 @@ fn build_response(tree: &Tree, note_ids: &HashSet<String>) -> Option<serde_json:
     // Keep the same field order in every element: id, then parent id, position, …
     let mut notes: Vec<NoteRow> = Vec::new();
     for id in note_ids {
-        let note = tree.notes.get(id)?;
+        // Ancestors/template targets can reference notes that are not present in the
+        // loaded set (e.g. already-deleted parents); skip those rather than failing the
+        // whole payload, matching the real collection that only walks known notes.
+        let Some(note) = tree.notes.get(id) else {
+            continue;
+        };
         notes.push(NoteRow {
             note_id: note.note_id.clone(),
             title: note.title.clone(),

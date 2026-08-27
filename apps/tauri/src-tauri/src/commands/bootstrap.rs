@@ -176,3 +176,10 @@ pub fn ping_test(app: AppHandle) -> String {
     let _ = messages::emit_to_frontend(&app, json!({ "type": "pong", "at": now }));
     "pong".to_string()
 }
+
+/// Diagnostic bridge: forwards a renderer error/unhandled rejection to the Rust
+/// terminal so the blank-window case can be diagnosed without the webview console.
+#[tauri::command]
+pub fn log_frontend_error(kind: String, message: String) {
+    eprintln!("[frontend-{kind}] {message}");
+}
