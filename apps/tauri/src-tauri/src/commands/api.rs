@@ -174,6 +174,93 @@ fn get_download(conn: &rusqlite::Connection, note_id: &str) -> Result<Value, Api
     Ok(json!(blob.content))
 }
 
+/// Resource-request handler backing the `api_get_resource` IPC command. This is
+/// the Tauri-side twin of the `GET /api/{path}` static-asset server that the real
+/// client fetches (fonts CSS, downloaded notes) but the shell has no HTTP layer
+/// for. Returns the raw content string, which the frontend bridge turns into a
+/// blob URL. `auto`-themed CSS resolves purely on the client; font CSS is built
+/// from the stored options like the original route did.
+#[tauri::command]
+pub fn get_api_resource(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
+    let guard = state.db.lock().expect("db lock");
+    let conn = guard
+        .as_ref()
+        .ok_or_else(|| "database unavailable".to_string())?;
+
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        ["fonts"] => Ok(build_font_css(conn)),
+        ["notes", "download", note_id] => db::get_note_blob(conn, note_id)
+            .map(|blob| blob.content)
+            .ok_or_else(|| format!("Note '{}' not found", note_id)),
+        ["notes", note_id, "blob"] => db::get_note_blob(conn, note_id)
+            .map(|blob| blob.content)
+            .ok_or_else(|| format!("Note '{}' not found", note_id)),
+        _ => Err(format!("Resource not found: {path}")),
+    }
+}
+
+/// Build the `api/fonts` CSS from the font-family/size options, mirroring the
+/// original `/api/fonts` route: only emitted when `overrideThemeFonts` is on,
+/// mapping each family option (`theme`/`system`/a concrete stack) onto the
+/// matching CSS custom property.
+fn build_font_css(conn: &rusqlite::Connection) -> String {
+    let override_theme_fonts = db::get_option(conn, "overrideThemeFonts")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if !override_theme_fonts {
+        return String::new();
+    }
+
+    const SANS_SERIF: &str = "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, Cantarell, Ubuntu, Noto Sans, Helvetica, Arial, sans-serif, Apple Color Emoji, Segoe UI Emoji";
+    const MONOSPACE: &str = "ui-monospace, SFMono-Regular, SF Mono, Consolas, Source Code Pro, Ubuntu Mono, Menlo, Liberation Mono, monospace";
+
+    let mut css = String::from("body {");
+
+    let main = resolve_font(db::get_option(conn, "mainFontFamily").as_deref(), SANS_SERIF);
+    if let Some(family) = main {
+        css.push_str(&format!(" --main-font-family: {family};"));
+    }
+    let tree = resolve_font(db::get_option(conn, "treeFontFamily").as_deref(), SANS_SERIF);
+    if let Some(family) = tree {
+        css.push_str(&format!(" --tree-font-family: {family};"));
+    }
+    let detail = resolve_font(db::get_option(conn, "detailFontFamily").as_deref(), SANS_SERIF);
+    if let Some(family) = detail {
+        css.push_str(&format!(" --detail-font-family: {family};"));
+    }
+    let mono = resolve_font(db::get_option(conn, "monospaceFontFamily").as_deref(), MONOSPACE);
+    if let Some(family) = mono {
+        css.push_str(&format!(" --monospace-font-family: {family};"));
+    }
+
+    css.push_str(&format!(
+        " --main-font-size: {}%; --tree-font-size: {}%; --detail-font-size: {}%; --monospace-font-size: {}%;",
+        db::get_option(conn, "mainFontSize").unwrap_or_else(|| "100".into()),
+        db::get_option(conn, "treeFontSize").unwrap_or_else(|| "100".into()),
+        db::get_option(conn, "detailFontSize").unwrap_or_else(|| "100".into()),
+        db::get_option(conn, "monospaceFontSize").unwrap_or_else(|| "100".into()),
+    ));
+
+    css.push('}');
+    css
+}
+
+/// Map a font-family option to a CSS value: `theme` uses the theme's own value
+/// (no override emitted), `system` expands to the platform stack, anything else
+/// is used verbatim. Returns `None` when the theme should decide.
+fn resolve_font(value: Option<&str>, system_stack: &str) -> Option<String> {
+    match value.unwrap_or("theme") {
+        "theme" => None,
+        "system" => Some(system_stack.to_string()),
+        other if other.is_empty() => None,
+        other => Some(other.to_string()),
+    }
+}
+
 /// The options endpoint returns a flat `Record<string, OptionValue>` map.
 fn get_options(conn: &rusqlite::Connection) -> Value {
     let mut map = serde_json::Map::new();

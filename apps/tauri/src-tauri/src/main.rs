@@ -132,6 +132,64 @@ const ELECTRON_BRIDGE_JS: &str = r#"
             try { fwd("console-error", Array.prototype.map.call(arguments, String).join(" ").slice(0, 2000)); } catch (x) {}
         };
     } catch (e) {}
+
+    // Intercept stylesheet links for `api/fonts` and `api/notes/download/{id}` — these are normally
+    // fetched over HTTP, but in this shell they are loaded on a `http://tauri.localhost/api/...` URL
+    // that no server answers (a native 404 the theme code would treat as a load failure and roll
+    // back). Instead we fetch the bytes over IPC and serve them as a `blob:` URL. The `api/...`
+    // href is never written into the DOM, so the browser never issues the doomed request — the blob
+    // URL is committed once the IPC response lands, which fires the stylesheet's `load` event that
+    // the client waits on. Covers the three client call sites: property `link.href = ...`
+    // (`font.ts`, `theme.ts`) and jQuery `setAttribute` (`glob.ts`).
+    (function () {
+        var origCreate = document.createElement.bind(document);
+        var apiPath = function (url) {
+            if (typeof url !== 'string') return null;
+            var i = url.indexOf('/api/');
+            var base = i >= 0 ? url.slice(i + 5) : (url.indexOf('api/') === 0 ? url.slice(4) : null);
+            if (base === null) return null;
+            return base.split('?')[0]; // drop a cache-busting query like `?v=N`
+        };
+        var loadCss = function (link, path) {
+            window.__TAURI__.core.invoke('api_get_resource', { path: path })
+                .then(function (css) {
+                    // The blob URL is not an `api/...` path, so it passes through our setAttribute.
+                    var url = URL.createObjectURL(new Blob([css], { type: 'text/css' }));
+                    link.setAttribute('href', url);
+                })
+                .catch(function (err) {
+                    fwd('resource-intercept', 'failed to fetch ' + path + ': ' + String(err));
+                });
+        };
+
+        document.createElement = function (tag, options) {
+            var el = origCreate(tag, options);
+            if (String(tag).toLowerCase() !== 'link') return el;
+
+            var href = '';
+            Object.defineProperty(el, 'href', {
+                get: function () { return href; },
+                set: function (v) {
+                    href = String(v);
+                    var p = apiPath(href);
+                    if (p) loadCss(el, p);
+                }
+            });
+            var origSetAttr = el.setAttribute.bind(el);
+            el.setAttribute = function (name, value) {
+                if (name === 'href') {
+                    var p = apiPath(String(value));
+                    if (p) {
+                        loadCss(el, p);
+                        return; // stash nothing in the DOM yet; blob URL lands later
+                    }
+                }
+                return origSetAttr(name, value);
+            };
+            return el;
+        };
+    })();
+
     // Periodic renderer state dumps at a few ages — a single 4s snapshot says nothing about whether
     // the desktop module (which imports note-autocomplete etc. over the network) finishes later.
     function dumpState() {
@@ -171,6 +229,7 @@ fn main() {
             commands::bootstrap::ping_test,
             commands::bootstrap::log_frontend_error,
             commands::api::api,
+            commands::api::get_api_resource,
             commands::ws::ws_send
         ])
         .setup(|app| {
