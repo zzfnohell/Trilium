@@ -96,6 +96,224 @@ pub fn open() -> rusqlite::Result<Option<Connection>> {
     Ok(None)
 }
 
+/// One attachment row as the client's `FAttachmentRow` (superset) expects it,
+/// from the `attachments` table joined with its blob for `contentLength`.
+pub struct AttachmentInfo {
+    pub attachment_id: String,
+    pub owner_id: String,
+    pub role: String,
+    pub mime: String,
+    pub title: String,
+    pub position: i64,
+    pub blob_id: Option<String>,
+    pub is_protected: bool,
+    pub content_length: i64,
+    pub date_modified: String,
+    pub utc_date_modified: String,
+    pub utc_date_scheduled_for_erasure_since: Option<String>,
+}
+
+impl AttachmentInfo {
+    pub fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(AttachmentInfo {
+            attachment_id: row.get(0)?,
+            owner_id: row.get(1)?,
+            role: row.get(2)?,
+            mime: row.get(3)?,
+            title: row.get(4)?,
+            content_length: row.get(5)?,
+            position: row.get(6)?,
+            blob_id: row.get(7)?,
+            is_protected: row.get::<_, i64>(8)? != 0,
+            date_modified: row.get(9)?,
+            utc_date_modified: row.get(10)?,
+            utc_date_scheduled_for_erasure_since: row.get(11)?,
+        })
+    }
+}
+
+/// The non-deleted attachments of a note, ordered by position — mirrors
+/// `BNote.getAttachments()`.
+pub fn get_note_attachments(conn: &Connection, note_id: &str) -> rusqlite::Result<Vec<AttachmentInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.attachmentId, a.ownerId, a.role, a.mime, a.title, \
+                LENGTH(b.content) AS contentLength, a.position, a.blobId, a.isProtected, \
+                a.dateModified, a.utcDateModified, a.utcDateScheduledForErasureSince \
+         FROM attachments a JOIN blobs b USING (blobId) \
+         WHERE a.ownerId = ?1 AND a.isDeleted = 0 ORDER BY a.position",
+    )?;
+    let rows = stmt.query_map([note_id], AttachmentInfo::from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Record that a note was recently visited (`POST /recent-notes`). `noteId` is
+/// the primary key, so visiting again overwrites with the fresh path/timestamp.
+pub fn add_recent_note(conn: &Connection, note_id: &str, note_path: &str, utc_date_created: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO recent_notes (noteId, notePath, utcDateCreated) VALUES (?1, ?2, ?3)",
+        rusqlite::params![note_id, note_path, utc_date_created],
+    )?;
+    Ok(())
+}
+
+/// Delete recent-note rows older than `cut_off` (inclusive window like the real
+/// route). Mirrors the original's opportunistic cleanup.
+pub fn delete_old_recent_notes(conn: &Connection, cut_off_utc: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM recent_notes WHERE utcDateCreated < ?1",
+        [cut_off_utc],
+    )?;
+    Ok(())
+}
+
+/// A note's timestamps, as the `notes/{id}/metadata` route returns them.
+pub struct NoteTimestamps {
+    pub date_created: String,
+    pub utc_date_created: String,
+    pub date_modified: String,
+    pub utc_date_modified: String,
+}
+
+/// The creation/modification timestamps of a (non-deleted) note.
+pub fn get_note_metadata(conn: &Connection, note_id: &str) -> Option<NoteTimestamps> {
+    conn.query_row(
+        "SELECT dateCreated, utcDateCreated, dateModified, utcDateModified \
+         FROM notes WHERE noteId = ?1 AND isDeleted = 0",
+        [note_id],
+        |row| {
+            Ok(NoteTimestamps {
+                date_created: row.get(0)?,
+                utc_date_created: row.get(1)?,
+                date_modified: row.get(2)?,
+                utc_date_modified: row.get(3)?,
+            })
+        },
+    )
+    .ok()
+}
+
+/// Count the relations that target `note_id` from non-search source notes —
+/// mirrors `getFilteredBacklinks().length` in `note_map.ts`.
+pub fn get_backlink_count(conn: &Connection, note_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) \
+         FROM attributes a JOIN notes n ON a.noteId = n.noteId \
+         WHERE a.type = 'relation' AND a.value = ?1 AND a.isDeleted = 0 \
+           AND n.type != 'search' AND n.isDeleted = 0",
+        [note_id],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// The title of a (non-deleted) note, or `None` if absent.
+pub fn get_note_title(conn: &Connection, note_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT title FROM notes WHERE noteId = ?1 AND isDeleted = 0",
+        [note_id],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// The `#icon` label value of a note, if it has one.
+pub fn get_note_icon(conn: &Connection, note_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM attributes \
+         WHERE noteId = ?1 AND type = 'label' AND name = 'icon' AND isDeleted = 0 LIMIT 1",
+        [note_id],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Notes a user has recently visited (the empty-query branch of `autocomplete`),
+/// newest first, excluding the active note — mirrors `getRecentNotes` in
+/// `autocomplete.ts`. Returns `(note_id, note_path)`.
+pub fn get_recent_notes(conn: &Connection, active_note_id: &str) -> Vec<(String, String)> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT rn.noteId, rn.notePath \
+         FROM recent_notes rn JOIN notes USING (noteId) \
+         WHERE notes.isDeleted = 0 AND notes.noteId != ?1 \
+         ORDER BY rn.utcDateCreated DESC LIMIT 200",
+    ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Ok(rows) = stmt.query_map([active_note_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        for row in rows.flatten() {
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// Resolve a simple label search of the form `#labelA #labelB ... #!excluded`
+/// into matching (non-deleted) note ids. A plain `#name` requires the note to
+/// carry that label; `#!name` requires it to be absent. Notes matching multiple
+/// positive labels must carry all of them. This is a small stand-in for the full
+/// search engine — enough for the `#workspace #!template` workspace switcher.
+pub fn search_notes_by_label_query(conn: &Connection, query: &str) -> Vec<String> {
+    let (positive, mut negative): (Vec<String>, Vec<String>) = query
+        .split_whitespace()
+        .fold((Vec::new(), Vec::new()), |(mut pos, mut neg), token| {
+            let token = token.trim().strip_prefix('#').unwrap_or(token.trim());
+            if let Some(name) = token.strip_prefix('!') {
+                if !name.is_empty() {
+                    neg.push(name.to_string());
+                }
+            } else if !token.is_empty() {
+                pos.push(token.to_string());
+            }
+            (pos, neg)
+        });
+
+    if positive.is_empty() {
+        return Vec::new();
+    }
+
+    // Require the note to carry every positive label.
+    let placeholders = positive.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let mut sql = format!(
+        "SELECT n.noteId FROM notes n WHERE n.isDeleted = 0 AND n.noteId IN ( \
+           SELECT noteId FROM attributes WHERE type = 'label' AND isDeleted = 0 \
+           AND name IN ({placeholders}) \
+           GROUP BY noteId HAVING COUNT(DISTINCT name) = {}",
+        positive.len()
+    );
+
+    let mut params: Vec<String> = positive;
+    if !negative.is_empty() {
+        negative.sort();
+        negative.dedup();
+        let neg = negative.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        sql.push_str(&format!(
+            " AND n.noteId NOT IN ( \
+               SELECT noteId FROM attributes WHERE type = 'label' AND name IN ({neg}) AND isDeleted = 0)"
+        ));
+        params.extend(negative);
+    }
+    sql.push(')');
+
+    let mut out = Vec::new();
+    let params_ref: Vec<&str> = params.iter().map(String::as_str).collect();
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(params_ref), |row| row.get::<_, String>(0)) {
+        for note_id in rows.flatten() {
+            out.push(note_id);
+        }
+    }
+    out
+}
+
 /// Whether the named table exists. Used as a lightweight "is the database
 /// initialized" check before reading rows from it.
 pub fn table_exists(conn: &Connection, table: &str) -> bool {

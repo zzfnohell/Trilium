@@ -210,6 +210,17 @@ fn collect_descendants(tree: &Tree, note_id: &str, collected: &mut HashSet<Strin
     }
 }
 
+/// Render the subtree for an explicit set of note ids (`POST /tree/load`), e.g.
+/// the notes a tab restore asks froca to preload. Mirrors the real `load` route:
+/// start from the requested notes, fold in their ancestors and template/inherit
+/// relation targets, and serialize the accumulated set.
+pub fn load_notes(conn: &Connection, note_ids: Vec<String>) -> Option<serde_json::Value> {
+    let tree = load(conn)?;
+    let mut collected: HashSet<String> = note_ids.into_iter().collect();
+    collect_ancestors_and_attributes(&tree, &mut collected);
+    build_response(&tree, &collected)
+}
+
 fn collect_ancestors_and_attributes(tree: &Tree, note_ids: &mut HashSet<String>) {
     let mut processed_branches: HashSet<String> = HashSet::new();
     let mut pending_ids: Vec<String> = note_ids.iter().cloned().collect();

@@ -93,7 +93,15 @@ const ELECTRON_BRIDGE_JS: &str = r#"
                     // browser history in this shell — report that nothing can unwind.
                     navigationCanGoBack: function () { return false; },
                     navigationCanGoForward: function () { return false; },
-                    navigationGoToIndex: noop
+                    navigationGetAllEntries: function () { return []; },
+                    navigationGetActiveIndex: function () { return -1; },
+                    navigationLength: function () { return 0; },
+                    navigationGoToIndex: noop,
+                    // `TabHistoryNavigationButtons` subscribes on mount; there is no history to
+                    // notify about, so swallow the subscription and clear any listeners on teardown.
+                    onDidNavigate: noop,
+                    onDidNavigateInPage: noop,
+                    removeDidNavigateListeners: noop
                 },
                 contextMenu: {
                     // The editor's native context menu wires itself to Electron's `contextMenu`.
