@@ -151,7 +151,9 @@ const ELECTRON_BRIDGE_JS: &str = r#"
             return base.split('?')[0]; // drop a cache-busting query like `?v=N`
         };
         var loadCss = function (link, path) {
-            window.__TAURI__.core.invoke('api_get_resource', { path: path })
+            if (link.__triliumApiServed) return; // already diverted (or waiting) — do not re-fire
+            link.__triliumApiServed = true;
+            window.__TAURI__.core.invoke('get_api_resource', { path: path })
                 .then(function (css) {
                     // The blob URL is not an `api/...` path, so it passes through our setAttribute.
                     var url = URL.createObjectURL(new Blob([css], { type: 'text/css' }));
@@ -166,16 +168,26 @@ const ELECTRON_BRIDGE_JS: &str = r#"
             var el = origCreate(tag, options);
             if (String(tag).toLowerCase() !== 'link') return el;
 
-            var href = '';
+            var origSetAttr = el.setAttribute.bind(el);
+            // The original IDL setter is captured here and re-applied for non-`api/` hrefs. The
+            // client's bundled assets (e.g. `bootstrap-*.css` injected by Vite's runtime) set
+            // `link.href = ...`; if we swallowed that without writing it back to the DOM, the
+            // browser would never fire the stylesheet's load event and the app's await on it
+            // would hang (blank window). Only `api/...` URLs are diverted to the IPC fetch.
             Object.defineProperty(el, 'href', {
-                get: function () { return href; },
+                get: function () {
+                    var v = el.getAttribute('href');
+                    return v == null ? '' : v;
+                },
                 set: function (v) {
-                    href = String(v);
-                    var p = apiPath(href);
-                    if (p) loadCss(el, p);
+                    var p = apiPath(String(v));
+                    if (p) {
+                        loadCss(el, p);
+                        return; // keep the DOM clean until the blob URL lands
+                    }
+                    origSetAttr('href', v);
                 }
             });
-            var origSetAttr = el.setAttribute.bind(el);
             el.setAttribute = function (name, value) {
                 if (name === 'href') {
                     var p = apiPath(String(value));
@@ -188,6 +200,25 @@ const ELECTRON_BRIDGE_JS: &str = r#"
             };
             return el;
         };
+
+        // Some DOM paths build the link outside our createElement hook (jQuery's parseHTML,
+        // document.createElementNS, templates) — the scheduled fire would then leave a raw
+        // `…/api/…` href that the protocol can never answer. Sweep the document a few times
+        // early on and divert any such link we have not already served.
+        var sweep = function () {
+            var links = Array.prototype.slice.call(document.querySelectorAll('link[href]'));
+            for (var i = 0; i < links.length; i++) {
+                var href = links[i].href || '';
+                if (!(href.indexOf('/api/') >= 0)) continue;
+                var path = apiPath(href);
+                if (path) loadCss(links[i], path);
+            }
+        };
+        document.addEventListener('DOMContentLoaded', function () {
+            setTimeout(sweep, 0);
+            setTimeout(sweep, 2000);
+            setTimeout(sweep, 8000);
+        });
     })();
 
     // Periodic renderer state dumps at a few ages — a single 4s snapshot says nothing about whether
@@ -197,7 +228,9 @@ const ELECTRON_BRIDGE_JS: &str = r#"
             var kids = Array.prototype.slice.call(document.body.children || []);
             var kidDesc = kids.slice(0, 8).map(function (k) { return k.tagName + "." + (k.className || "").toString().split(" ").slice(0,3).join("."); });
             var links = Array.prototype.slice.call(document.querySelectorAll('link[rel=stylesheet]'));
-            var failing = links.filter(function (l) { return !(l.sheet && l.sheet.cssRules && l.sheet.cssRules.length > 0); });
+            // Blob-URL stylesheets (the diverted api/fonts + note css) never expose cssRules in this
+            // shell, so they are not loading failures — exclude them from the failing list.
+            var failing = links.filter(function (l) { return !(l.href && l.href.indexOf('blob:') === 0) && !(l.sheet && l.sheet.cssRules && l.sheet.cssRules.length > 0); });
             fwd("state", JSON.stringify({
                 readyState: document.readyState,
                 bodyDisplay: document.body.style.display,
