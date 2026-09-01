@@ -8,18 +8,6 @@ Trilium Notes is a hierarchical note-taking application with synchronization, sc
 
 ## Development Commands
 
-```bash
-corepack enable && pnpm install         # setup
-pnpm server:start                        # dev server at http://localhost:8080
-pnpm desktop:start                       # Electron dev app
-pnpm standalone:start                    # standalone (in-browser) client
-pnpm client:build | server:build | desktop:build
-pnpm --filter <pkg> test <pattern>      # e.g. pnpm --filter server test spec/etapi/search.spec.ts
-pnpm --filter <pkg> coverage             # per-package coverage (client, server, standalone)
-pnpm typecheck                           # all projects, native compiler, a few seconds
-pnpm dev:format-check | dev:format-fix   # stylistic formatting
-```
-
 - **Never run ESLint** (`dev:linter-check`, `dev:linter-fix`, `npx eslint`) — it dies with an out-of-memory error, so a run tells you nothing. CI does not lint either — there is no `eslint`/`linter-check` step anywhere in `.github/workflows/`, so lint findings never block a merge; the gates are `pnpm typecheck` and the per-package `test --coverage` runs. (`packages/*` is ignored by the ESLint config anyway.)
 - **Never run `pnpm test:all`, `test:parallel`, `test:sequential`, or a whole-package `coverage`** during development — CI runs them on every push. Run the **narrowest** suite that covers what you touched: `pnpm --filter <pkg> test <pattern>` (Vitest treats the trailing argument as a substring filter over spec paths). Core specs need **two** runs, server and standalone (see Testing). Only reach for a full suite if the user asks or wants a final check.
 - **Typecheck with `pnpm typecheck`, not a raw `tsc`** — it resolves the project references a hand-written `tsc -p …` gets wrong, and is far cheaper than a test suite. Still, run it **once, after a piece of work is finished** — not after every edit: it builds the project references, and repeating it is a common way to lose minutes across a session.
@@ -34,21 +22,6 @@ pnpm dev:format-check | dev:format-fix   # stylistic formatting
 - **`git rm` is not a neutral delete.** It leaves the deletion staged, so a commit made before the matching reference updates are staged lands a `HEAD` pointing at a module that no longer exists. When removing a file whose references are edited in the same pass, delete it from the filesystem instead, or land the deletion and the reference updates together — never leave the index in a state that is broken on its own.
 
 ## Monorepo Structure
-
-```
-apps/
-  client/               # Preact frontend (+ legacy jQuery widgets); shared by server, desktop, standalone
-  server/               # Node.js backend (Express, better-sqlite3); serves the client, REST/WebSocket
-  desktop/              # Electron: server + client in one process (see developing-electron-desktop skill)
-  standalone/           # whole stack in the browser: core in a Web Worker on SQLite WASM + OPFS, no Node (see developing-standalone skill)
-  mobile/               # Capacitor shell around standalone (see developing-capacitor-mobile skill)
-  web-clipper/, website/, db-compare/, dump-db/, edit-docs/, build-docs/, icon-pack-builder/, script-deployer/
-packages/
-  trilium-core/         # entities, services, SQL, sync, most API routes — shared by server, desktop, standalone
-  commons/              # types + utilities shared with the client
-  trilium-e2e/          # shared Playwright tests
-  ckeditor5/, codemirror/, highlightjs/, share-theme/, pdfjs-viewer/, splitjs/, turndown-plugin-gfm/
-```
 
 `pnpm --filter <package> <command>` runs a command in one package.
 
@@ -173,7 +146,7 @@ Use `note.getOwnedAttribute()` for direct, `note.getAttribute()` for inherited.
 
 ## Code Style
 
-- 4-space indent, semicolons, double quotes, max line 100, Unix line endings (the format config enforces these). Imports sorted per `eslint-plugin-simple-import-sort` (packages before relative, alphabetical within a group) — only ESLint checks that and it isn't run locally, so sort by hand.
+- Imports sorted per `eslint-plugin-simple-import-sort` (packages before relative, alphabetical within a group) — only ESLint checks that and it isn't run locally, so sort by hand.
 - **Never use the non-null assertion `!`**, tests included. Narrow instead: `?.`, `?? fallback`, an explicit check, or an `*OrThrow` accessor (`becca.getNoteOrThrow(id)`).
 - **Never use `Array.prototype.forEach`** — write a `for...of` loop instead, and iterate `array.entries()` when the index is needed (`for (const [index, item] of arr.entries())`). It reads better and allows `break`/`continue`/`await`.
 - **Helpers go below the primary export** they support (or in another module), never between the imports and the main definition — the entry point reads first.
@@ -219,17 +192,17 @@ Two traps this catches:
 ## Recipes
 
 ### Storing User Preferences
-**No `localStorage`** — preferences are synced options. To add one: (1) type in `OptionDefinitions`, `packages/commons/src/lib/options_interface.ts`; (2) default in `defaultOptions`, `packages/trilium-core/src/services/options_init.ts`; (3) **whitelist it in `ALLOWED_OPTIONS`**, `packages/trilium-core/src/routes/api/options.ts` — otherwise the API rejects writes with "Option 'X' is not allowed to be changed"; (4) a control in the matching settings pane (`apps/client/src/widgets/type_widgets/options/*.tsx`) plus its English key; (5) read/write via `useTriliumOption` / `useTriliumOptionBool` / `useTriliumOptionInt` / `useTriliumOptionJson`. Details: `docs/Developer Guide/Developer Guide/Concepts/Options/Creating a new option.md`.
+**No `localStorage`** — preferences are synced options. Follow the **`creating-a-new-option` skill** (details: `docs/Developer Guide/Developer Guide/Concepts/Options/Creating a new option.md`).
 
 ### Adding Hidden System Notes
-The `_hidden` subtree holds system notes with deterministic `_`-prefixed IDs so every sync instance builds the same tree; `checkHiddenSubtree()` creates them at startup. Add the `HiddenSubtreeItem` (from `@triliumnext/commons`) to `buildHiddenSubtreeDefinition()` in `packages/trilium-core/src/services/hidden_subtree.ts` — `id` (starts with `_`), `title` (key under `"hidden-subtree"` in `server.json`), `type`, `icon` (`bx-name`, no `bx ` prefix), `attributes`, `children`, `content`; `enforceAttributes` / `enforceBranches` / `enforceDeleted: true` keep attributes, placement and removals in sync. Launcher-bar entries: `hidden_subtree_launcherbar.ts`; templates: `hidden_subtree_templates.ts`.
+Follow the **`adding-hidden-system-notes` skill**.
 
 ### Writing to Notes from Server Services
 - `note.setContent()` requires a CLS (Continuation Local Storage) context — wrap calls in `cls.init(() => { ... })` (from `packages/trilium-core/src/services/context.ts`)
 - Operations called from Express routes already have CLS context; standalone services (schedulers, Electron IPC handlers) do not
 
 ### Adding New LLM Tools
-Tools are `defineTools({...})` registries in `packages/trilium-core/src/services/llm/tools/` (`note_tools`, `attribute_tools`, `attachment_tools`, `hierarchy_tools`, …), served to both the LLM chat and the MCP server. Each tool: `description`, Zod `inputSchema`, `execute`, `mutates: true` for writes. A new module goes into `allToolRegistries` in `tools/index.ts`; Node-only tools (in-app docs) live in `apps/server/src/services/llm/tools/` and use `registerToolRegistry()` from `apps/server/src/services/llm/index.ts`. Add the client label under `llm.tools.<tool_name>` in imperative tense ("Search notes"). Mirror ETAPI's field choices but **don't import ETAPI mappers** — inline them so the LLM layer stays decoupled.
+Follow the **`adding-llm-mcp-tools` skill** (registries, the synchronous-`execute` contract, registration, client labels).
 
 ### Server-Side Static Assets
 Node-side assets (templates, translations, prompts) live in `apps/server/src/assets/` and are read via `RESOURCE_DIR` from `apps/server/src/services/resource_dir.ts` (`path.join(RESOURCE_DIR, "llm", "prompts", …)`); assets core itself reads (`schema.sql`, LLM skills) live in `packages/trilium-core/src/assets/`. **Never resolve paths with `import.meta.url`/`fileURLToPath` or `__dirname` + relative path** — the server is bundled to CJS and both point at the bundle, not the source tree.
