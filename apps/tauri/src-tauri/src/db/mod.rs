@@ -351,6 +351,18 @@ pub fn get_all_options(conn: &Connection) -> Vec<(String, String)> {
     out
 }
 
+/// Upsert a single option value (`options.setOption`), preserving the existing
+/// `isSynced` flag when the row already exists — password options are synced.
+pub fn set_option(conn: &Connection, name: &str, value: &str) -> rusqlite::Result<()> {
+    let utc = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3fZ").to_string();
+    conn.execute(
+        "INSERT INTO options (name, value, isSynced, utcDateModified) VALUES (?1, ?2, 1, ?3) \
+         ON CONFLICT(name) DO UPDATE SET value = excluded.value, utcDateModified = excluded.utcDateModified",
+        rusqlite::params![name, value, utc],
+    )?;
+    Ok(())
+}
+
 /// The greatest `entity_change` id, optionally filtered to synced rows. Mirrors
 /// the `maxEntityChangeIdAtLoad` / `maxEntityChangeSyncIdAtLoad` bootstrap values.
 pub fn max_entity_change_id(conn: &Connection, synced_only: bool) -> i64 {

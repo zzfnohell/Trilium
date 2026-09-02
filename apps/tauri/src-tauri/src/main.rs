@@ -15,8 +15,10 @@
 // 已经支持 `electronApi.ws`。
 
 mod commands;
+mod crypto;
 mod db;
 mod messages;
+mod services;
 
 use std::sync::Mutex;
 

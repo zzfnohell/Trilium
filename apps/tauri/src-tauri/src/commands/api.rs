@@ -12,12 +12,14 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use chrono::{Duration, Utc};
 use rand::Rng;
 
 use crate::db::{self, tree};
+use crate::messages;
+use crate::services::protected_session as session;
 use crate::AppState;
 
 /// A structured HTTP-style error that the client bridge turns back into a
@@ -35,7 +37,7 @@ impl std::fmt::Display for ApiError {
 }
 
 #[tauri::command]
-pub fn api(state: State<'_, AppState>, method: String, url: String, data: Option<Value>) -> Value {
+pub fn api(state: State<'_, AppState>, app: AppHandle, method: String, url: String, data: Option<Value>) -> Value {
     let db_guard = state.db.lock().expect("db lock");
     let db: &Option<rusqlite::Connection> = &db_guard;
 
@@ -44,7 +46,7 @@ pub fn api(state: State<'_, AppState>, method: String, url: String, data: Option
         Some(conn) => {
             // `tree` is the only route that needs the method+query; the rest are
             // simple reads. Dispatch by path + a tiny bit of query parsing.
-            dispatch(conn, &method, &url, &data)
+            dispatch(conn, &app, &method, &url, &data)
         }
     };
 
@@ -61,7 +63,7 @@ pub fn api(state: State<'_, AppState>, method: String, url: String, data: Option
     }
 }
 
-fn dispatch(conn: &rusqlite::Connection, method: &str, url: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &str, data: &Option<Value>) -> Result<Value, ApiError> {
     // Strip the optional query string and split the path into segments.
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p, q),
@@ -72,6 +74,7 @@ fn dispatch(conn: &rusqlite::Connection, method: &str, url: &str, data: &Option<
     // The write path so far is a single route: editing a note's data.
     if method == "PUT" {
         return match segments.as_slice() {
+            ["notes", note_id, "protect", protect] => protect_note(conn, app, note_id, protect, query),
             ["notes", note_id, "data"] => put_note_data(conn, note_id, data),
             _ => Err(not_found(&format!("No route for PUT {url}"))),
         };
@@ -86,6 +89,11 @@ fn dispatch(conn: &rusqlite::Connection, method: &str, url: &str, data: &Option<
             // rows older than 24h; keep that on a small probability to avoid a write
             // on every keystroke when a note is opened once.
             ["recent-notes"] => add_recent_note(conn, data),
+            ["login", "protected"] => login_protected(conn, app, data),
+            ["login", "protected", "touch"] => touch_protected(),
+            ["logout", "protected"] => logout_protected(app),
+            ["password", "change"] => change_password(conn, data),
+            ["password", "reset"] => reset_password(conn, query),
             _ => Err(not_found(&format!("No route for POST {url}"))),
         };
     }
@@ -143,9 +151,14 @@ fn dispatch(conn: &rusqlite::Connection, method: &str, url: &str, data: &Option<
 
 fn get_blob(conn: &rusqlite::Connection, note_id: &str) -> Result<Value, ApiError> {
     let blob = db::get_note_blob(conn, note_id).ok_or_else(|| not_found(&format!("Note '{}' not found", note_id)))?;
+    // Protected content is decrypt-and-serve when the session is active and
+    // blanked otherwise (`blob.ts` `processContent`); an open blob URL answers
+    // with nothing rather than the ciphertext.
+    let note = db::get_note(conn, note_id);
+    let content = session::process_content(note.map_or(false, |n| n.is_protected), blob.content);
     Ok(json!({
         "blobId": blob.blob_id,
-        "content": blob.content,
+        "content": content,
         "contentLength": blob.content_length,
         "dateModified": blob.date_modified,
         "utcDateModified": blob.utc_date_modified,
@@ -159,7 +172,7 @@ fn get_note(conn: &rusqlite::Connection, note_id: &str) -> Result<Value, ApiErro
     let note = db::get_note(conn, note_id).ok_or_else(|| not_found(&format!("Note '{}' not found", note_id)))?;
     Ok(json!({
         "noteId": note.note_id,
-        "title": note.title,
+        "title": session::title_or_mask(note.is_protected, note.title),
         "isProtected": note.is_protected,
         "type": note.note_type,
         "mime": note.mime,
@@ -356,7 +369,7 @@ fn get_attachments(conn: &rusqlite::Connection, note_id: &str) -> Result<Value, 
                 "ownerId": a.owner_id,
                 "role": a.role,
                 "mime": a.mime,
-                "title": a.title,
+                "title": session::title_or_mask(a.is_protected, a.title),
                 "position": a.position,
                 "blobId": a.blob_id,
                 "isProtected": a.is_protected,
@@ -474,7 +487,266 @@ fn hex_val(b: u8) -> Option<u8> {
 
 /// `PUT /notes/{id}/data` — the edit-save write path. Routes to the faithful sync
 /// write and returns the (empty) body the real route produces.
+/// Log in to the protected session: verify the password, decrypt the data key,
+/// emit the `protectedSessionLogin` websocket message to cause the client to
+/// reload all notes (they get decrypted).
+fn login_protected(
+    conn: &rusqlite::Connection,
+    app: &AppHandle,
+    data: &Option<Value>,
+) -> Result<Value, ApiError> {
+    let Some(payload) = data else {
+        return Err(bad_request("Missing payload for login/protected"));
+    };
+    let password = payload.get("password").and_then(Value::as_str).unwrap_or_default();
+
+    if !session::verify_password(conn, password) {
+        return Ok(json!({ "success": false, "message": "Given current password doesn't match hash" }));
+    }
+    let Some(key) = session::get_data_key(conn, password) else {
+        return Ok(json!({ "success": false, "message": "Unable to obtain data key." }));
+    };
+    session::set_data_key(key);
+
+    messages::emit_to_frontend(app, json!({ "type": "protectedSessionLogin" }));
+
+    Ok(json!({ "success": true }))
+}
+
+/// Touch the protected session (keep the timeout countdown ticking); the client does
+/// this periodically, so accept it and do nothing.
+fn touch_protected() -> Result<Value, ApiError> {
+    // The session already touches on the write path; this is a no-op.
+    Ok(json!({}))
+}
+
+/// Log out of the protected session: reset the global data key, emit the
+/// `protectedSessionLogout` message which the client handles by reloading the
+/// frontend to clear all the decrypted content in memory.
+fn logout_protected(app: &AppHandle) -> Result<Value, ApiError> {
+    session::reset();
+    messages::emit_to_frontend(app, json!({ "type": "protectedSessionLogout" }));
+    Ok(json!({}))
+}
+
+/// Change the current password from `current_password` to `new_password`. Fails if the
+/// current password does not pass verification. Re-salts everything: fresh salts,
+/// fresh verification hash, and the existing data key re-wrapped under the new key.
+fn change_password(conn: &rusqlite::Connection, data: &Option<Value>) -> Result<Value, ApiError> {
+    let Some(payload) = data else {
+        return Err(bad_request("Missing payload for password/change"));
+    };
+    let current_password = payload.get("current_password").and_then(Value::as_str).unwrap_or_default();
+    let new_password = payload.get("new_password").and_then(Value::as_str).unwrap_or_default();
+
+    match session::change_password(conn, current_password, new_password) {
+        session::PasswordChange::Ok => Ok(json!({ "success": true })),
+        session::PasswordChange::WrongPassword => Ok(json!({ "success": false, "message": "Wrong current password" })),
+    }
+}
+
+/// Reset the password: clear all password options, which permanently locks any
+/// protected notes the user already has protected.
+fn reset_password(conn: &rusqlite::Connection, query: &str) -> Result<Value, ApiError> {
+    if query.split('?').next() != Some("really") {
+        return Ok(json!({ "success": false,
+            "message": "Please confirm the reset by adding `?really=yesIReallyWantToResetPasswordAndLoseAccessToMyProtectedNotes` to the URL" }));
+    }
+    session::reset_password(conn).map_err(|err| ApiError {
+        status: 500,
+        message: err.to_string(),
+    })?;
+    Ok(json!({ "success": true }))
+}
+
+/// Protect or unprotect a note (and optionally its subtree) recursively, like the
+/// Node service does:
+/// - Each note (and every revision) gets `isProtected` flipped and the content
+///   re-encrypted under the current data key.
+/// - Sends `protectNotes` task progress events over the websocket channel like the
+///   original service, which the client progress dialog picks up.
+fn protect_note(
+    conn: &rusqlite::Connection,
+    app: &AppHandle,
+    note_id: &str,
+    protect_raw: &str,
+    query: &str,
+) -> Result<Value, ApiError> {
+    let protect = protect_raw == "1";
+    let subtree = query.split('?').any(|seg| seg == "subtree=1");
+
+    if !session::is_available() {
+        return Err(ApiError {
+            status: 400,
+            message: "Cannot (un)protect a note when protected session is not available".to_string(),
+        });
+    }
+
+    let Some(mut note_row) = db::get_note(conn, note_id) else {
+        return Err(not_found(&format!("Note '{}' not found", note_id)));
+    };
+
+    let pre_is_protected = note_row.is_protected;
+    if pre_is_protected != protect {
+        // Read the current content, flip the flag, and force-save (which re-encrypts).
+        let Some(blob_id) = note_row.blob_id else {
+            return Err(ApiError { status: 400, message: "note has no blob".to_string() });
+        };
+        let Some((blob_content, _)) = get_blob_for_write(conn, &blob_id, pre_is_protected) else {
+            return Err(ApiError { status: 500, message: "cannot read existing content".to_string() });
+        };
+        note_row.is_protected = protect;
+        update_note_content_and_hash(conn, &note_row, &blob_content)?;
+    }
+
+    // Recursively update all attachments (protect/unprotect them like the note)
+    let mut progress = 0;
+    for att in db::get_note_attachments(conn, note_id).map_err(|err| ApiError {
+        status: 500,
+        message: format!("failed to get attachments: {err}"),
+    })? {
+        let att_is_protected = att.is_protected;
+        if att_is_protected != protect {
+            progress += 1;
+            messages::emit_to_frontend(app, json!({
+                "type": "taskProgressCount",
+                "taskType": "protectNotes",
+                "data": { "protect": protect },
+                "progressCount": progress,
+            }));
+
+            let Some(blob_id) = &att.blob_id else { continue };
+            let Some((blob_content, _)) = get_blob_for_write(conn, blob_id, att_is_protected) else {
+                continue;
+            };
+
+            if let Err(err) = update_attachment(conn, note_id, &att, blob_content, protect) {
+                eprintln!("[trilium-tauri] failed to update attachment {}: {}", att.attachment_id, err);
+            }
+        }
+    }
+
+    if subtree {
+        // Walk the whole subtree and change protection on every descendant note, like
+        // `noteService.protectNoteRecursively`.
+        let mut stmt = conn.prepare(
+            "SELECT childBranch.noteId FROM branches \
+             JOIN notes ON branches.childNoteId = notes.noteId \
+              WHERE branches.parentNoteId = ?1 AND branches.isDeleted = 0 AND notes.isDeleted = 0",
+        ).map_err(|err| ApiError {
+            status: 500,
+            message: format!("failed to prepare child query: {err}"),
+        })?;
+        let mut child_ids: Vec<String> = stmt
+            .query_map([note_id], |row| row.get(0))
+            .map_err(|err| ApiError {
+                status: 500,
+                message: format!("failed to query children: {err}"),
+            })?
+            .flatten()
+            .collect();
+
+        for child_id in child_ids {
+            protect_note(conn, app, &child_id, if protect { "1" } else { "0" }, "subtree=1")?;
+        }
+    }
+
+    messages::emit_to_frontend(app, json!({
+        "type": "taskSucceeded",
+        "taskType": "protectNotes",
+        "data": { "protect": protect },
+        "result": null,
+    }));
+
+    Ok(json!({}))
+}
+
+/// Get the raw blob content (the plaintext when protected and session is open, the ciphertext
+/// when locked) for a write path that needs to re-encrypt after toggling protection.
+fn get_blob_for_write(
+    conn: &rusqlite::Connection,
+    blob_id: &str,
+    was_protected: bool,
+) -> Option<(Vec<u8>, bool)> {
+    let row: Option<(Option<String>)> = conn
+        .query_row("SELECT content FROM blobs WHERE blobId = ?1", [blob_id], |row| row.get(0))
+        .ok();
+    let Some(content) = row else {
+        return None;
+    };
+    if was_protected {
+        // It was protected before; if a session is open the content was stored encrypted
+        // and we decrypt it now so it can be re-encrypted under the new flag.
+        Some((
+            session::decrypt_bytes(&content?)
+                .unwrap_or_else(|| content.clone().into_bytes()),
+            was_protected,
+        ))
+    } else {
+        // It was plaintext before; leave it as-is (UTF-8 string → bytes).
+        Some((content.unwrap_or_default().into_bytes(), was_protected))
+    }
+}
+
+/// After toggling the attachment's protection flag, update the content blob
+/// (encrypted if now protected, plaintext if not) and write the change.
+fn update_attachment(
+    conn: &rusqlite::Connection,
+    _note_id: &str,
+    att: &db::AttachmentInfo,
+    content: &[u8],
+    now_protected: bool,
+) -> Result<(), rusqlite::Error> {
+    let local = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%z").to_string();
+    let utc = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3fZ").to_string();
+    let blob_id = att.blob_id.as_ref().expect("attachment has no blob");
+    // The content goes into `blobs` with the hash calculated on the unencrypted
+    // prefixed content exactly like the node write path (`saveBlob`).
+    let hashed = crate::db::write::hashed_blob_id_bytes(content, now_protected);
+
+    conn.execute(
+        "UPDATE attachments SET isProtected = ?1, blobId = ?2, dateModified = ?3, utcDateModified = ?4 \
+          WHERE attachmentId = ?5",
+        rusqlite::params![i32::from(now_protected), hashed, local, utc, att.attachment_id],
+    )?;
+    Ok(())
+}
+
+/// After toggling the note's protection flag, update the note row with the new flag and
+/// persist the (possibly re-encrypted) content blob.
+fn update_note_content_and_hash(
+    conn: &rusqlite::Connection,
+    note: &db::NoteInfo,
+    content: &[u8],
+) -> Result<(), ApiError> {
+    use crate::db::write;
+    let utc = write::utc_now();
+    let local = write::local_now();
+
+    let unencrypted = write::get_unencrypted_for_hash(note.is_protected, content);
+    let new_blob_id = write::hashed_blob_id_bytes(&unencrypted, note.is_protected);
+
+    conn.execute(
+        "UPDATE notes SET isProtected = ?1, blobId = ?2, dateModified = ?3, utcDateModified = ?4 \
+          WHERE noteId = ?5",
+        rusqlite::params![i32::from(note.is_protected), new_blob_id, local, utc, note.note_id],
+    ).map_err(|err| ApiError {
+        status: 500,
+        message: format!("failed to update note: {err}"),
+    })?;
+
+    let old_blob_id = note.blob_id;
+    if old_blob_id != Some(new_blob_id.clone()) {
+        if let Err(err) = crate::db::write::delete_blob_if_not_used(conn, &new_blob_id) {
+            eprintln!("[trilium-tauri] failed to delete unused blob {}: {}", new_blob_id, err);
+        }
+    }
+
+    Ok(())
+}
+
 fn put_note_data(conn: &rusqlite::Connection, note_id: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+
     let content = data
         .as_ref()
         .and_then(|v| v.get("content"))
