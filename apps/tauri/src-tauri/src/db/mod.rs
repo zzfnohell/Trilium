@@ -12,7 +12,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub mod tree;
 pub mod write;
@@ -148,6 +148,61 @@ pub fn get_note_attachments(conn: &Connection, note_id: &str) -> rusqlite::Resul
         out.push(row?);
     }
     Ok(out)
+}
+
+/// A single non-deleted attachment by id — the `attachments/{id}` and
+/// `attachments/{id}/all` reads.
+pub fn get_attachment(conn: &Connection, attachment_id: &str) -> rusqlite::Result<Option<AttachmentInfo>> {
+    conn.query_row(
+        "SELECT a.attachmentId, a.ownerId, a.role, a.mime, a.title, \
+                LENGTH(b.content) AS contentLength, a.position, a.blobId, a.isProtected, \
+                a.dateModified, a.utcDateModified, a.utcDateScheduledForErasureSince \
+         FROM attachments a JOIN blobs b USING (blobId) \
+         WHERE a.attachmentId = ?1 AND a.isDeleted = 0",
+        [attachment_id],
+        AttachmentInfo::from_row,
+    )
+    .optional()
+}
+
+/// An attachment's blob metadata for `attachments/{id}/blob`. Content is binary,
+/// so the pojo carries the length but a `null` content — mirroring `getBlobPojo`
+/// for non-string entities.
+pub struct AttachmentBlob {
+    pub blob_id: String,
+    pub content_length: i64,
+    pub date_modified: String,
+    pub utc_date_modified: String,
+}
+
+pub fn get_attachment_blob(conn: &Connection, attachment_id: &str) -> rusqlite::Result<Option<AttachmentBlob>> {
+    conn.query_row(
+        "SELECT b.blobId, LENGTH(b.content), b.dateModified, b.utcDateModified \
+         FROM attachments a JOIN blobs b ON a.blobId = b.blobId \
+         WHERE a.attachmentId = ?1 AND a.isDeleted = 0",
+        [attachment_id],
+        |row| {
+            Ok(AttachmentBlob {
+                blob_id: row.get(0)?,
+                content_length: row.get(1)?,
+                date_modified: row.get(2)?,
+                utc_date_modified: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// The raw bytes of an attachment's blob (decrypted for protected attachments
+/// when the session is open), for the image-info and image-serving reads.
+pub fn get_attachment_content(conn: &Connection, attachment_id: &str) -> rusqlite::Result<Option<(Vec<u8>, bool)>> {
+    conn.query_row(
+        "SELECT b.content, a.isProtected FROM attachments a JOIN blobs b ON a.blobId = b.blobId \
+         WHERE a.attachmentId = ?1 AND a.isDeleted = 0",
+        [attachment_id],
+        |row| Ok((row.get::<_, Option<Vec<u8>>>(0)?.unwrap_or_default(), row.get::<_, i64>(1)? != 0)),
+    )
+    .optional()
 }
 
 /// Record that a note was recently visited (`POST /recent-notes`). `noteId` is

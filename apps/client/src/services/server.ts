@@ -92,6 +92,20 @@ async function remove<T>(url: string, componentId?: string) {
 }
 
 async function upload(url: string, fileToUpload: File, componentId?: string, method = "PUT") {
+    // Desktop shells (Electron/Tauri) load the page from a custom protocol with no HTTP server
+    // behind it, so a multipart `$.ajax` would go nowhere. Send the file over the same IPC `api`
+    // command the JSON requests use: the bytes are base64-encoded into the payload the Rust
+    // dispatcher parses for the upload routes (method + URL identify which one). The jQuery
+    // FormData branch below stays for the browser (standalone/web) builds.
+    if (isDesktopShell()) {
+        const resp = await ajaxViaIpc(url, method, {
+            fileName: fileToUpload.name,
+            mimeType: fileToUpload.type,
+            content: await readFileAsBase64(fileToUpload),
+        }, {});
+        return resp.body;
+    }
+
     const formData = new FormData();
     formData.append("upload", fileToUpload);
 
@@ -118,6 +132,23 @@ async function upload(url: string, fileToUpload: File, componentId?: string, met
         }
         throw e;
     }
+}
+
+/**
+ * The raw bytes of a `File` as a base64 string (the payload half of `readAsDataURL`).
+ * JSON — and with it the IPC `api` payload — cannot carry a `Uint8Array`, so the file
+ * travels encoded, matching the base64 `content` field of the JSON attachment routes.
+ */
+function readFileAsBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const result = reader.result as string;
+            resolve(result.slice(result.indexOf(",") + 1));
+        };
+        reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"));
+        reader.readAsDataURL(file);
+    });
 }
 
 let maxKnownEntityChangeId = 0;

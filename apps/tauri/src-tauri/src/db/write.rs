@@ -308,12 +308,25 @@ fn note_hash(note: &WriteNote, is_deleted: bool) -> String {
 }
 
 /// `BNote.save()`: stamp fresh timestamps and persist the note row + entity change.
+/// Persists every editable field, not just the blob — the note-save path in
+/// `update_note_data` only ever changes the blob, but the file/image routes write
+/// `mime` and `isProtected` in the same row and rely on this to carry them.
 fn save_note(conn: &Connection, note: &WriteNote) -> rusqlite::Result<()> {
     let local = local_now();
     let utc = utc_now();
     conn.execute(
-        "UPDATE notes SET blobId = ?1, dateModified = ?2, utcDateModified = ?3 WHERE noteId = ?4",
-        params![note.blob_id, local, utc, note.note_id],
+        "UPDATE notes SET title = ?1, isProtected = ?2, type = ?3, mime = ?4, blobId = ?5, \
+                dateModified = ?6, utcDateModified = ?7 WHERE noteId = ?8",
+        params![
+            note.title,
+            i64::from(note.is_protected),
+            note.note_type,
+            note.mime,
+            note.blob_id,
+            local,
+            utc,
+            note.note_id,
+        ],
     )?;
     put_entity_change(conn, "notes", &note.note_id, &note_hash(note, false), &utc)
 }
@@ -648,7 +661,7 @@ fn inspect_image(bytes: &[u8]) -> Option<DetectedImage> {
 
 /// `encodeURIComponent`: percent-encode everything outside the RFC 3986 "unreserved" set, leaving
 /// ASCII letters, digits and `-_.!~*'()` bare. Multi-byte UTF-8 is encoded byte by byte, as JS does.
-fn encode_uri_component(input: &str) -> String {
+pub fn encode_uri_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for &b in input.as_bytes() {
         match b {
@@ -1052,7 +1065,6 @@ fn save_links(conn: &Connection, note: &WriteNote, content: &str, downloaded: &H
         return Ok(content.to_string());
     }
 
-    let mut found: Vec<FoundLink> = Vec::new();
     let rewritten = if note.note_type == "text" {
         // Localize images first (inline base64 + fetched remote), then lift inline `<a>` attachments;
         // both run before link scanning so the relations match the written form of the content.
@@ -1062,34 +1074,7 @@ fn save_links(conn: &Connection, note: &WriteNote, content: &str, downloaded: &H
         content.to_string()
     };
 
-    let image_api = Regex::new(r"api/images/([a-zA-Z0-9_]+)/").unwrap();
-    let hash_root = Regex::new(r"#root[a-zA-Z0-9_/]*/([a-zA-Z0-9_]+)").unwrap();
-    let wiki = Regex::new(r"\[\[([a-zA-Z0-9_]+)\]\]").unwrap();
-    let href_src = Regex::new(r#"src="[^"]*api/images/([a-zA-Z0-9_]+)/"#).unwrap();
-    let href_root = Regex::new(r#"href="[^"]*#root[a-zA-Z0-9_/]*/([a-zA-Z0-9_]+)/?""#).unwrap();
-    let include_note = Regex::new(r#"<section class="include-note[^>]+data-note-id="([a-zA-Z0-9_]+)"[^>]*>"#).unwrap();
-
-    if note.note_type == "text" {
-        for cap in href_src.captures_iter(&rewritten) {
-            found.push(FoundLink { name: "imageLink", value: cap[1].to_string() });
-        }
-        for cap in href_root.captures_iter(&rewritten) {
-            found.push(FoundLink { name: "internalLink", value: cap[1].to_string() });
-        }
-        for cap in include_note.captures_iter(&rewritten) {
-            found.push(FoundLink { name: "includeNoteLink", value: cap[1].to_string() });
-        }
-    } else if is_markdown {
-        for cap in image_api.captures_iter(&rewritten) {
-            found.push(FoundLink { name: "imageLink", value: cap[1].to_string() });
-        }
-        for cap in hash_root.captures_iter(&rewritten) {
-            found.push(FoundLink { name: "internalLink", value: cap[1].to_string() });
-        }
-        for cap in wiki.captures_iter(&rewritten) {
-            found.push(FoundLink { name: "internalLink", value: cap[1].to_string() });
-        }
-    }
+    let mut found = collect_content_links(note, is_markdown, &rewritten);
 
     // Dedup, but only keep links whose target note exists (mirrors the becca lookup).
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
@@ -1116,9 +1101,48 @@ fn save_links(conn: &Connection, note: &WriteNote, content: &str, downloaded: &H
     check_image_attachments(conn, &note.note_id, is_markdown, &rewritten)
 }
 
+/// The `internalLink` / `imageLink` / `includeNoteLink` relations a note's content names
+/// (`scanForLinks` in the real server). Shared by the edit-save write and the post-conversion
+/// parent rewrite — the latter runs it on content whose pictures are already localized, so the
+/// image-download half of `save_links` is skipped there.
+fn collect_content_links(note: &WriteNote, is_markdown: bool, content: &str) -> Vec<FoundLink> {
+    let mut found: Vec<FoundLink> = Vec::new();
+
+    if note.note_type == "text" {
+        let image_api = Regex::new(r#"src="[^"]*api/images/([a-zA-Z0-9_]+)/"#).unwrap();
+        for cap in image_api.captures_iter(content) {
+            found.push(FoundLink { name: "imageLink", value: cap[1].to_string() });
+        }
+        let href_root = Regex::new(r#"href="[^"]*#root[a-zA-Z0-9_/]*/([a-zA-Z0-9_]+)/?""#).unwrap();
+        for cap in href_root.captures_iter(content) {
+            found.push(FoundLink { name: "internalLink", value: cap[1].to_string() });
+        }
+        let include_note = Regex::new(r#"<section class="include-note[^>]+data-note-id="([a-zA-Z0-9_]+)"[^>]*>"#).unwrap();
+        for cap in include_note.captures_iter(content) {
+            found.push(FoundLink { name: "includeNoteLink", value: cap[1].to_string() });
+        }
+    } else if is_markdown {
+        let image_api = Regex::new(r"api/images/([a-zA-Z0-9_]+)/").unwrap();
+        for cap in image_api.captures_iter(content) {
+            found.push(FoundLink { name: "imageLink", value: cap[1].to_string() });
+        }
+        let hash_root = Regex::new(r"#root[a-zA-Z0-9_/]*/([a-zA-Z0-9_]+)").unwrap();
+        for cap in hash_root.captures_iter(content) {
+            found.push(FoundLink { name: "internalLink", value: cap[1].to_string() });
+        }
+        let wiki = Regex::new(r"\[\[([a-zA-Z0-9_]+)\]\]").unwrap();
+        for cap in wiki.captures_iter(content) {
+            found.push(FoundLink { name: "internalLink", value: cap[1].to_string() });
+        }
+    }
+
+    found
+}
+
 /// Attribute entity hash over `attributeId|noteId|type|name|value|isInheritable`.
-fn attribute_hash(attribute_id: &str, note_id: &str, attr_type: &str, name: &str, value: &str, is_deleted: bool) -> String {
-    let mut input = format!("{attribute_id}|{note_id}|{attr_type}|{name}|{value}|false");
+fn attribute_hash(attribute_id: &str, note_id: &str, attr_type: &str, name: &str, value: &str, is_inheritable: bool, is_deleted: bool) -> String {
+    let inheritable = if is_inheritable { "true" } else { "false" };
+    let mut input = format!("{attribute_id}|{note_id}|{attr_type}|{name}|{value}|{inheritable}");
     if is_deleted {
         input.push_str("|deleted");
     }
@@ -1147,7 +1171,7 @@ fn insert_attribute(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, 0)",
         params![attribute_id, note_id, attr_type, name, value, max_position + 10, utc],
     )?;
-    let hash = attribute_hash(&attribute_id, note_id, attr_type, name, value, false);
+    let hash = attribute_hash(&attribute_id, note_id, attr_type, name, value, false, false);
     put_entity_change(conn, "attributes", &attribute_id, &hash, &utc)
 }
 
@@ -1158,7 +1182,7 @@ fn delete_attribute(conn: &Connection, attribute_id: &str, note_id: &str, attr_t
         "UPDATE attributes SET isDeleted = 1, deleteId = NULL, utcDateModified = ?1 WHERE attributeId = ?2",
         params![utc, attribute_id],
     )?;
-    let hash = attribute_hash(attribute_id, note_id, attr_type, name, value, true);
+    let hash = attribute_hash(attribute_id, note_id, attr_type, name, value, false, true);
     put_entity_change(conn, "attributes", attribute_id, &hash, &utc)
 }
 
@@ -1377,10 +1401,17 @@ fn collect_note_and_descendants(conn: &Connection, note_id: &str, subtree: bool,
 }
 
 /// Read a blob's stored bytes and, for a protected entity, decrypt them to the
-/// plaintext. Binary and TEXT storage both come back as bytes here.
+/// plaintext. TEXT and BLOB storage both come back as bytes here — string notes hold
+/// their content as TEXT, binary entities as BLOB.
 fn read_clear_bytes(conn: &Connection, blob_id: &str, was_protected: bool) -> rusqlite::Result<Vec<u8>> {
     let stored: Option<Vec<u8>> = conn
-        .query_row("SELECT content FROM blobs WHERE blobId = ?1", params![blob_id], |row| row.get(0))
+        .query_row("SELECT content FROM blobs WHERE blobId = ?1", params![blob_id], |row| {
+            match row.get::<_, rusqlite::types::Value>(0)? {
+                rusqlite::types::Value::Text(text) => Ok(text.into_bytes()),
+                rusqlite::types::Value::Blob(bytes) => Ok(bytes),
+                _ => Ok(Vec::new()),
+            }
+        })
         .optional()?;
     let Some(stored) = stored else {
         return Ok(Vec::new());
@@ -1597,6 +1628,795 @@ fn protect_one_note(conn: &Connection, note_id: &str, protect: bool) -> rusqlite
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Attachment CRUD — `saveAttachment`, `renameAttachment`, `deleteAttachment` and
+// the `markAsDeleted` side of the attachments panel.
+// ---------------------------------------------------------------------------
+
+/// The `attachments` entity hash, over `attachmentId|ownerId|role|mime|title|blobId|
+/// utcDateScheduledForErasureSince` (`undefined` when unset), `+deleted` suffix for
+/// the soft-delete state.
+fn attachment_hash_value(
+    attachment_id: &str,
+    owner_id: &str,
+    role: &str,
+    mime: &str,
+    title: &str,
+    blob_id: &str,
+    scheduled: Option<&str>,
+    is_deleted: bool,
+) -> String {
+    let scheduled = scheduled.unwrap_or("undefined");
+    let mut input = format!("|{attachment_id}|{owner_id}|{role}|{mime}|{title}|{blob_id}|{scheduled}");
+    if is_deleted {
+        input.push_str("|deleted");
+    }
+    hash10(&input)
+}
+
+/// `note.saveAttachment`: find an existing attachment (by its id, or by title
+/// within the note with `matchBy=title`), otherwise create one owned by the note
+/// with the note's protection. Matched attachments only re-store their content
+/// (metadata stays as stored); the write is force-saved, so the row is always
+/// re-stamped and recorded even when the blob id is unchanged.
+pub fn save_attachment_route(
+    conn: &Connection,
+    note_id: &str,
+    attachment_id: Option<&str>,
+    role: &str,
+    mime: &str,
+    title: &str,
+    content: Option<Vec<u8>>,
+    match_by: Option<&str>,
+) -> Result<String, WriteError> {
+    let note = load_note(conn, note_id)
+        .map_err(WriteError::from)?
+        .ok_or_else(|| WriteError::not_found(note_id))?;
+
+    let existing: Option<(String, String, String, String, bool, String)> = if match_by == Some("title") && !title.is_empty() {
+        conn.query_row(
+            "SELECT attachmentId, role, mime, title, isProtected, COALESCE(blobId, '') FROM attachments \
+             WHERE ownerId = ?1 AND title = ?2 AND isDeleted = 0 LIMIT 1",
+            params![note_id, title],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(WriteError::from)?
+    } else if let Some(id) = attachment_id {
+        conn.query_row(
+            "SELECT attachmentId, role, mime, title, isProtected, COALESCE(blobId, '') FROM attachments \
+             WHERE attachmentId = ?1 AND isDeleted = 0",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(WriteError::from)?
+    } else {
+        None
+    };
+
+    // `content = content || ""`, like the real service: an absent payload still
+    // force-writes an (empty) blob.
+    let content = content.unwrap_or_default();
+
+    if let Some((id, _role, _mime, _title, is_protected, old_blob)) = existing {
+        if old_blob.is_empty() {
+            return Err(WriteError {
+                status: 404,
+                message: format!("Attachment '{}' has no blob", id),
+            });
+        }
+        let local = local_now();
+        let utc = utc_now();
+        let (new_blob, _hash_str) = store_attachment_blob(conn, is_protected, &content, &local, &utc)?;
+        conn.execute(
+            "UPDATE attachments SET blobId = ?1, dateModified = ?2, utcDateModified = ?3 WHERE attachmentId = ?4",
+            params![new_blob, local, utc, id],
+        )?;
+        let owner_id: String = conn.query_row("SELECT ownerId FROM attachments WHERE attachmentId = ?1", params![id], |row| row.get(0))?;
+        // Re-stat with the stored title/role/mime so the hash matches the row.
+        let (role, mime, title, scheduled): (String, String, String, Option<String>) = conn.query_row(
+            "SELECT role, mime, title, utcDateScheduledForErasureSince FROM attachments WHERE attachmentId = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        put_entity_change(
+            conn,
+            "attachments",
+            &id,
+            &attachment_hash_value(&id, &owner_id, &role, &mime, &title, &new_blob, scheduled.as_deref(), false),
+            &utc,
+        )?;
+        if new_blob != old_blob {
+            delete_blob_if_not_used(conn, &old_blob)?;
+        }
+        Ok(id)
+    } else {
+        let local = local_now();
+        let utc = utc_now();
+        save_attachment(conn, note_id, role, mime, title, note.is_protected, &content, &local, &utc)
+            .map_err(WriteError::from)
+    }
+}
+
+/// Store one attachment's content as a blob (encrypted when protected) and
+/// return its id plus the content string/bytes the entity change hash needs.
+fn store_attachment_blob(
+    conn: &Connection,
+    is_protected: bool,
+    content: &[u8],
+    local: &str,
+    utc: &str,
+) -> rusqlite::Result<(String, String)> {
+    if is_protected {
+        let encrypted = session::encrypt(content).ok_or(rusqlite::Error::InvalidQuery)?;
+        let stored = encrypted.into_bytes();
+        let hash_str = comma_joined(&stored);
+        let blob_id = blob_id_for(true, content);
+        insert_blob(conn, &blob_id, BlobContent::Bytes(&stored), &hash_str, local, utc)?;
+        Ok((blob_id, hash_str))
+    } else {
+        let hash_str = comma_joined(content);
+        let blob_id = hashed_blob_id_bytes(content);
+        insert_blob(conn, &blob_id, BlobContent::Bytes(content), &hash_str, local, utc)?;
+        Ok((blob_id, hash_str))
+    }
+}
+
+/// `renameAttachment`: non-empty title, encrypted at rest for protected
+/// attachments; the attachment row and its entity change follow.
+pub fn rename_attachment(conn: &Connection, attachment_id: &str, title: &str) -> Result<(), WriteError> {
+    if title.trim().is_empty() {
+        return Err(WriteError {
+            status: 400,
+            message: "Title must not be empty".to_string(),
+        });
+    }
+    let Some((owner_id, role, mime, is_protected, blob_id, scheduled)) = conn
+        .query_row(
+            "SELECT ownerId, role, mime, isProtected, COALESCE(blobId, ''), utcDateScheduledForErasureSince \
+             FROM attachments WHERE attachmentId = ?1 AND isDeleted = 0",
+            params![attachment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(WriteError::from)?
+    else {
+        return Err(WriteError::not_found(attachment_id));
+    };
+
+    let stored_title = if is_protected {
+        session::encrypt_string(title).ok_or(rusqlite::Error::InvalidQuery).map_err(WriteError::from)?
+    } else {
+        title.to_string()
+    };
+    let local = local_now();
+    let utc = utc_now();
+    conn.execute(
+        "UPDATE attachments SET title = ?1, dateModified = ?2, utcDateModified = ?3 WHERE attachmentId = ?4",
+        params![stored_title, local, utc, attachment_id],
+    )?;
+    put_entity_change(
+        conn,
+        "attachments",
+        attachment_id,
+        &attachment_hash_value(attachment_id, &owner_id, &role, &mime, &stored_title, &blob_id, scheduled.as_deref(), false),
+        &utc,
+    )?;
+    Ok(())
+}
+
+/// `deleteAttachment` — `BAttachment.markAsDeleted()`: soft-delete the row,
+/// stamp it and record the deleted entity change. A missing attachment is a
+/// silent no-op, like `becca.getAttachment` returning null in the real route.
+pub fn delete_attachment(conn: &Connection, attachment_id: &str) -> Result<(), WriteError> {
+    let Some((owner_id, role, mime, title, blob_id, scheduled)) = conn
+        .query_row(
+            "SELECT ownerId, role, mime, title, COALESCE(blobId, ''), utcDateScheduledForErasureSince \
+             FROM attachments WHERE attachmentId = ?1 AND isDeleted = 0",
+            params![attachment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(WriteError::from)?
+    else {
+        return Ok(());
+    };
+
+    let utc = utc_now();
+    conn.execute(
+        "UPDATE attachments SET isDeleted = 1, deleteId = NULL, utcDateModified = ?1 WHERE attachmentId = ?2",
+        params![utc, attachment_id],
+    )?;
+    put_entity_change(
+        conn,
+        "attachments",
+        attachment_id,
+        &attachment_hash_value(attachment_id, &owner_id, &role, &mime, &title, &blob_id, scheduled.as_deref(), true),
+        &utc,
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Multipart uploads and convert-to-note — the `server.upload` twins and
+// `BAttachment.convertToNote` (attachment → note).
+// ---------------------------------------------------------------------------
+
+/// Whether the given MIME type is handled as a picture by the upload endpoints —
+/// `isAcceptedImageMime` over the shared list in `commons` `image_mimes.ts`.
+fn is_accepted_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png"
+            | "image/jpg"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/bmp"
+            | "image/webp"
+            | "image/avif"
+            | "image/svg"
+            | "image/svg+xml"
+            | "image/x-icon"
+            | "image/vnd.microsoft.icon"
+    )
+}
+
+/// How an uploaded file was stored by `POST /notes/{id}/attachments/upload`; the
+/// URL the route answers with differs by branch, mirroring `uploadAttachment`.
+pub enum UploadedAttachment {
+    /// Stored as an `image`-role attachment; addressed as `api/attachments/{id}/image/{title}`.
+    Image { attachment_id: String, title: String },
+    /// Stored as a `file`-role attachment; addressed as a reference link to the attachments panel.
+    File { attachment_id: String },
+}
+
+/// `POST /notes/{id}/attachments/upload` — `attachmentsApiRoute.uploadAttachment`.
+/// A picture becomes an `image`-role attachment and answers with its serving URL; anything else
+/// becomes a `file` attachment and answers with the attachments-panel reference instead.
+pub fn save_uploaded_attachment(
+    conn: &Connection,
+    note_id: &str,
+    original_name: &str,
+    mime: &str,
+    content: &[u8],
+) -> Result<UploadedAttachment, WriteError> {
+    let note = load_note(conn, note_id)
+        .map_err(WriteError::from)?
+        .ok_or_else(|| WriteError::not_found(note_id))?;
+    if note.is_protected && !session::is_available() {
+        return Err(WriteError::unavailable(note_id));
+    }
+
+    let local = local_now();
+    let utc = utc_now();
+    if is_accepted_image_mime(mime) {
+        let (attachment_id, title) = save_image_attachment(conn, &note, original_name, content, &local, &utc)
+            .map_err(WriteError::from)?;
+        Ok(UploadedAttachment::Image { attachment_id, title })
+    } else {
+        let attachment_id = save_attachment(conn, note_id, "file", original_name, mime, note.is_protected, content, &local, &utc)
+            .map_err(WriteError::from)?;
+        Ok(UploadedAttachment::File { attachment_id })
+    }
+}
+
+/// Store an uploaded file as a note's content and point the note at it. The whole
+/// `setContent` tail of `updateNoteData`: dedup blob, swap the note's blob id, delete
+/// the old blob if unused — with the note's mime already updated by the caller.
+fn store_note_content(conn: &Connection, note: &mut WriteNote, content: &[u8], is_string: bool) -> rusqlite::Result<()> {
+    let local = local_now();
+    let utc = utc_now();
+    let new_blob = store_entity_content(conn, note.is_protected, is_string, content, &local, &utc)?;
+    if note.blob_id.as_deref() != Some(new_blob.as_str()) {
+        let old_blob = note.blob_id.take();
+        note.blob_id = Some(new_blob);
+        save_note(conn, note)?;
+        if let Some(old) = old_blob {
+            delete_blob_if_not_used(conn, &old)?;
+        }
+    }
+    Ok(())
+}
+
+/// `asyncPostProcessContent` (`scanForLinks`) for the routes that replace a note's content
+/// without sending it through `update_note_data`: keep the link relations, bookmark labels and
+/// image-attachment erasure schedules in agreement with the new content. Unlike `save_links`,
+/// pictures are not localized or downloaded — they were already in the content.
+fn post_process_links(conn: &Connection, note: &WriteNote, content: &str) -> rusqlite::Result<()> {
+    let is_markdown = note.note_type == "code"
+        && matches!(note.mime.as_str(), "text/markdown" | "text/x-markdown" | "text/x-gfm");
+    if note.note_type != "text" && !is_markdown {
+        return Ok(());
+    }
+    let found = collect_content_links(note, is_markdown, content);
+    sync_relations(conn, &note.note_id, &found)?;
+    sync_bookmarks(conn, &note.note_id, content)?;
+    check_image_attachments(conn, &note.note_id, is_markdown, content)?;
+    Ok(())
+}
+
+/// `PUT /notes/{id}/file` — `filesRoute.updateFile`: write an uploaded file over a note's
+/// content. `replace=1` skips the revision snapshot (an editor saving its own work); otherwise a
+/// revision is taken first, exactly like `note.saveRevision()`.
+pub fn update_file_note(conn: &Connection, note_id: &str, original_name: &str, mime: &str, content: &[u8], replace: bool) -> Result<(), WriteError> {
+    if let Some(note) = load_note(conn, note_id).map_err(WriteError::from)? {
+        if note.is_protected && !session::is_available() {
+            return Err(WriteError::unavailable(note_id));
+        }
+    } else {
+        return Err(WriteError::not_found(note_id));
+    }
+
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> rusqlite::Result<()> {
+        // Re-load inside the transaction so the snapshot reflects the row we hold the lock on.
+        let mut note = load_note(conn, note_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if note.is_protected && !session::is_available() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        if !replace {
+            create_revision(conn, &note)?;
+        }
+        note.mime = mime.to_lowercase();
+        let is_string = is_string_note(&note.note_type, &note.mime);
+        store_note_content(conn, &mut note, content, is_string)?;
+        set_note_label(conn, note_id, "originalFileName", original_name)?;
+        Ok(())
+    })();
+    match run {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            // Run outside the transaction like `void asyncPostProcessContent` in the real route.
+            if let Ok(saved) = load_note(conn, note_id) {
+                if let Some(saved) = saved {
+                    let text = String::from_utf8_lossy(content).into_owned();
+                    let _ = post_process_links(conn, &saved, &text);
+                }
+            }
+            Ok(())
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::not_found(note_id))
+        }
+        Err(rusqlite::Error::InvalidQuery) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::unavailable(note_id))
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::from(err))
+        }
+    }
+}
+
+/// `PUT /attachments/{id}/file` — `filesRoute.updateAttachment`: overwrite an attachment's
+/// file, snapshotting the owning note first (`attachment.getNote().saveRevision()`).
+pub fn update_file_attachment(conn: &Connection, attachment_id: &str, mime: &str, content: &[u8]) -> Result<(), WriteError> {
+    let Some((owner_id, role, title, is_protected, old_blob, scheduled)) = conn
+        .query_row(
+            "SELECT ownerId, role, title, isProtected, COALESCE(blobId, ''), utcDateScheduledForErasureSince \
+             FROM attachments WHERE attachmentId = ?1 AND isDeleted = 0",
+            params![attachment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(WriteError::from)?
+    else {
+        return Err(WriteError {
+            status: 404,
+            message: format!("Attachment '{}' not found", attachment_id),
+        });
+    };
+
+    let owner = load_note(conn, &owner_id)
+        .map_err(WriteError::from)?
+        .ok_or_else(|| WriteError::not_found(&owner_id))?;
+    if (owner.is_protected || is_protected) && !session::is_available() {
+        return Err(WriteError::unavailable(&owner_id));
+    }
+
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> rusqlite::Result<()> {
+        let owner = load_note(conn, &owner_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        create_revision(conn, &owner)?;
+
+        let local = local_now();
+        let utc = utc_now();
+        let new_blob = store_attachment_blob(conn, is_protected, content, &local, &utc)?.0;
+        conn.execute(
+            "UPDATE attachments SET mime = ?1, blobId = ?2, dateModified = ?3, utcDateModified = ?4 WHERE attachmentId = ?5",
+            params![mime.to_lowercase(), new_blob, local, utc, attachment_id],
+        )?;
+        put_entity_change(
+            conn,
+            "attachments",
+            attachment_id,
+            &attachment_hash_value(attachment_id, &owner_id, &role, &mime.to_lowercase(), &title, &new_blob, scheduled.as_deref(), false),
+            &utc,
+        )?;
+        if new_blob != old_blob {
+            delete_blob_if_not_used(conn, &old_blob)?;
+        }
+        Ok(())
+    })();
+    match run {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            match err {
+                rusqlite::Error::QueryReturnedNoRows => Err(WriteError::not_found(&owner_id)),
+                rusqlite::Error::InvalidQuery => Err(WriteError::unavailable(&owner_id)),
+                other => Err(WriteError::from(other)),
+            }
+        }
+    }
+}
+
+/// `PUT /images/{noteId}` — `imageRoute.updateImage`: replace an image note's content,
+/// snapshotting it first and detecting the format from the byte soup (the real route
+/// re-compresses; this shell stores the bytes as given).
+pub fn update_image_note(conn: &Connection, note_id: &str, original_name: &str, content: &[u8]) -> Result<(), WriteError> {
+    if let Some(note) = load_note(conn, note_id).map_err(WriteError::from)? {
+        if note.is_protected && !session::is_available() {
+            return Err(WriteError::unavailable(note_id));
+        }
+    } else {
+        return Err(WriteError::not_found(note_id));
+    }
+
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> rusqlite::Result<()> {
+        let mut note = load_note(conn, note_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if note.is_protected && !session::is_available() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        create_revision(conn, &note)?;
+        let mime = inspect_image(content).map_or("unknown", |d| d.mime).to_string();
+        note.mime = mime;
+        let is_string = is_string_note(&note.note_type, &note.mime);
+        store_note_content(conn, &mut note, content, is_string)?;
+        set_note_label(conn, note_id, "originalFileName", original_name)?;
+        Ok(())
+    })();
+    match run {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::not_found(note_id))
+        }
+        Err(rusqlite::Error::InvalidQuery) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::unavailable(note_id))
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::from(err))
+        }
+    }
+}
+
+/// The note + branch a note creation produced, as the `convert-to-note` response needs them.
+pub struct NewNote {
+    pub note_id: String,
+    pub branch_id: String,
+    pub parent_note_id: String,
+    pub note_position: i64,
+}
+
+/// `getNewNotePosition` + `BBranch.beforeSaving`: one step below the deepest child,
+/// skipping the `_hidden` pseudo-note that pins itself to the end of the list.
+fn note_position_for(conn: &Connection, parent_note_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(notePosition), 0) + 10 FROM branches \
+         WHERE parentNoteId = ?1 AND isDeleted = 0 AND noteId != '_hidden'",
+        params![parent_note_id],
+        |row| row.get(0),
+    )
+}
+
+/// `BNote.setLabel`: keep a single `label`-type attribute of the given name — update the
+/// existing non-deleted one, insert when absent. Used for `originalFileName` on the
+/// file/image replace routes.
+fn set_note_label(conn: &Connection, note_id: &str, name: &str, value: &str) -> rusqlite::Result<()> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT attributeId FROM attributes WHERE noteId = ?1 AND type = 'label' AND name = ?2 AND isDeleted = 0 LIMIT 1",
+            params![note_id, name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(attribute_id) = existing {
+        let utc = utc_now();
+        conn.execute(
+            "UPDATE attributes SET value = ?1, utcDateModified = ?2 WHERE attributeId = ?3",
+            params![value, utc, attribute_id],
+        )?;
+        let hash = attribute_hash(&attribute_id, note_id, "label", name, value, false, false);
+        put_entity_change(conn, "attributes", &attribute_id, &hash, &utc)?;
+    } else {
+        insert_attribute(conn, note_id, "label", name, value)?;
+    }
+    Ok(())
+}
+
+/// `copyChildAttributes`: the parent's `child:`-prefixed attributes are copied onto a
+/// newly created child with the prefix stripped (so `child:template` on the parent seeds a
+/// `~template` on the child). A `child:template` relation whose target is a note of a
+/// different type is skipped — the explicitly chosen type wins over the default template.
+fn copy_child_attributes(conn: &Connection, parent_note_id: &str, child_note_id: &str) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT type, name, value, position, isInheritable FROM attributes \
+         WHERE noteId = ?1 AND name LIKE 'child:%' AND isDeleted = 0",
+    )?;
+    let rows: Vec<(String, String, String, i64, i64)> = stmt
+        .query_map(params![parent_note_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (attr_type, name, value, position, is_inheritable) in rows {
+        let stripped = name.strip_prefix("child:").unwrap_or(&name).to_string();
+        if attr_type == "relation" && stripped == "template" {
+            let template_type: Option<String> = conn
+                .query_row("SELECT type FROM notes WHERE noteId = ?1 AND isDeleted = 0", params![value], |row| row.get(0))
+                .optional()?;
+            let child_type: String = conn.query_row("SELECT type FROM notes WHERE noteId = ?1", params![child_note_id], |row| row.get(0))?;
+            if let Some(template_type) = template_type {
+                if template_type != child_type {
+                    continue;
+                }
+            }
+        }
+        let attribute_id = random_string(12);
+        let utc = utc_now();
+        conn.execute(
+            "INSERT INTO attributes (attributeId, noteId, type, name, value, position, utcDateModified, isDeleted, deleteId, isInheritable) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)",
+            params![attribute_id, child_note_id, attr_type, stripped, value, position, utc, is_inheritable],
+        )?;
+        let hash = attribute_hash(&attribute_id, child_note_id, &attr_type, &stripped, &value, is_inheritable != 0, false);
+        put_entity_change(conn, "attributes", &attribute_id, &hash, &utc)?;
+    }
+    Ok(())
+}
+
+/// `noteService.createNewNote` for this shell: a note under a parent with content stored
+/// according to its type, a branch, and `child:`-prefixed attributes copied from the parent.
+/// Requires the caller to hold a transaction. Returns the new note's ids.
+pub fn create_new_note(
+    conn: &Connection,
+    parent_note_id: &str,
+    title: &str,
+    note_type: &str,
+    mime: &str,
+    is_protected: bool,
+    content: &[u8],
+) -> rusqlite::Result<NewNote> {
+    let note_id = random_string(12);
+    let branch_id = format!("{parent_note_id}_{note_id}");
+    let local = local_now();
+    let utc = utc_now();
+
+    // Note titles are encrypted at rest while the note is protected, like every other write.
+    let stored_title = if is_protected {
+        session::encrypt_string(title).ok_or(rusqlite::Error::InvalidQuery)?
+    } else {
+        title.to_string()
+    };
+    let is_string = is_string_note(note_type, mime);
+    let blob_id = store_entity_content(conn, is_protected, is_string, content, &local, &utc)?;
+    let note_position = note_position_for(conn, parent_note_id)?;
+
+    conn.execute(
+        "INSERT INTO notes (noteId, title, isProtected, type, mime, blobId, isDeleted, deleteId, \
+                dateCreated, dateModified, utcDateCreated, utcDateModified) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7, ?8, ?9, ?10)",
+        params![
+            note_id,
+            stored_title,
+            i64::from(is_protected),
+            note_type,
+            mime,
+            blob_id,
+            local,
+            local,
+            utc,
+            utc,
+        ],
+    )?;
+    let note = WriteNote {
+        note_id: note_id.clone(),
+        title: stored_title,
+        note_type: note_type.to_string(),
+        mime: mime.to_string(),
+        is_protected,
+        blob_id: Some(blob_id),
+        date_modified: local,
+        utc_date_created: utc.clone(),
+        utc_date_modified: utc.clone(),
+    };
+    put_entity_change(conn, "notes", &note.note_id, &note_hash(&note, false), &utc)?;
+
+    conn.execute(
+        "INSERT INTO branches (branchId, noteId, parentNoteId, notePosition, prefix, isExpanded, isDeleted, deleteId, utcDateModified) \
+         VALUES (?1, ?2, ?3, ?4, '', 0, 0, NULL, ?5)",
+        params![branch_id, note_id, parent_note_id, note_position, utc],
+    )?;
+    let branch_input = format!("|{branch_id}|{note_id}|{parent_note_id}|");
+    put_entity_change(conn, "branches", &branch_id, &hash10(&branch_input), &utc)?;
+
+    copy_child_attributes(conn, parent_note_id, &note.note_id)?;
+
+    Ok(NewNote { note_id, branch_id, parent_note_id: parent_note_id.to_string(), note_position })
+}
+
+/// `BAttachment.convertToNote`: lift the attachment into a note of its own under the
+/// parent (image/favicon → image note, file → file note), re-point the parent's text content
+/// at the new note, and soft-delete the attachment. Requires the transaction to be held open
+/// by the caller. Returns the created note ids.
+pub fn convert_attachment_to_note(conn: &Connection, attachment_id: &str) -> Result<NewNote, WriteError> {
+    let Some((owner_id, role, mime, title, is_protected, blob_id)) = conn
+        .query_row(
+            "SELECT ownerId, role, mime, title, isProtected, COALESCE(blobId, '') \
+             FROM attachments WHERE attachmentId = ?1 AND isDeleted = 0",
+            params![attachment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(WriteError::from)?
+    else {
+        return Err(WriteError {
+            status: 404,
+            message: format!("Attachment '{}' not found", attachment_id),
+        });
+    };
+
+    let note_type = match role.as_str() {
+        "image" | "favicon" => "image",
+        "file" => "file",
+        other => {
+            return Err(WriteError {
+                status: 400,
+                message: format!("Mapping from attachment role '{other}' to note's type is not defined"),
+            });
+        }
+    };
+
+    // `isContentAvailable`: a protected attachment is only convertible while the session is open.
+    if is_protected && !session::is_available() {
+        return Err(WriteError {
+            status: 400,
+            message: format!("Cannot convert protected attachment '{}' outside of protected session", attachment_id),
+        });
+    }
+
+    let parent = load_note(conn, &owner_id)
+        .map_err(WriteError::from)?
+        .ok_or_else(|| WriteError::not_found(&owner_id))?;
+    if parent.is_protected && !session::is_available() {
+        return Err(WriteError::unavailable(&owner_id));
+    }
+
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> rusqlite::Result<NewNote> {
+        let clear = read_clear_bytes(conn, &blob_id, is_protected)?;
+        let created = create_new_note(conn, &owner_id, &title, note_type, &mime, is_protected, &clear)?;
+
+        delete_attachment(conn, attachment_id).map_err(|err| {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(1), Some(err.message))
+        })?;
+
+        // A text parent gets its content re-pointed at the converted note: embedded image URLs
+        // (`api/attachments/{id}/image/...`) become `api/images/{noteId}/...` and reference links
+        // to the attachment collapse to a plain note link (the `&` may be HTML-encoded as `&amp;`).
+        let parent_note = load_note(conn, &owner_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if parent_note.note_type == "text" {
+            let orig_bytes = read_clear_bytes(conn, &parent_note.blob_id.clone().unwrap_or_default(), parent_note.is_protected)?;
+            let orig = String::from_utf8_lossy(&orig_bytes).into_owned();
+            let mut fixed = orig.clone();
+            if note_type == "image" {
+                let old_url = format!("api/attachments/{attachment_id}/image/");
+                let new_url = format!("api/images/{}/", created.note_id);
+                fixed = fixed.replace(&old_url, &new_url);
+            }
+            let href_re = Regex::new(&format!(r#"href="[^"]*attachmentId={attachment_id}[^"]*""#)).unwrap();
+            fixed = href_re
+                .replace_all(&fixed, format!(r##"href="#root/{}""##, created.note_id))
+                .into_owned();
+
+            // Re-scan the parent (not the new image/file note, which has no scannable links) so its
+            // link relations and orphaned-image schedules reflect the rewritten content.
+            post_process_links(conn, &parent_note, &fixed)?;
+
+            if fixed != orig {
+                let mut parent_note = parent_note;
+                store_note_content(conn, &mut parent_note, fixed.as_bytes(), true)?;
+            }
+        }
+        Ok(created)
+    })();
+    match run {
+        Ok(created) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(created)
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::not_found(&owner_id))
+        }
+        Err(rusqlite::Error::InvalidQuery) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::unavailable(&owner_id))
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::from(err))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -1750,5 +2570,186 @@ mod tests {
             "content should be rewritten to attachment URLs"
         );
         eprintln!("write-path verification passed for note {note_id}");
+    }
+
+    /// The upload-endpoint picture gate matches the shared `image_mimes` list exactly.
+    #[test]
+    fn accepted_image_mimes_match_commons_list() {
+        for mime in [
+            "image/png",
+            "image/jpg",
+            "image/jpeg",
+            "image/gif",
+            "image/bmp",
+            "image/webp",
+            "image/avif",
+            "image/svg",
+            "image/svg+xml",
+            "image/x-icon",
+            "image/vnd.microsoft.icon",
+        ] {
+            assert!(is_accepted_image_mime(mime), "{mime} should be a picture");
+        }
+        for mime in ["text/plain", "application/pdf", "image/tiff", "", "whatever"] {
+            assert!(!is_accepted_image_mime(mime), "{mime:?} should not be a picture");
+        }
+    }
+
+    /// A reusable helper for the multipart/convert integration run: a surviving,
+    /// non-protected text note that `load_note` can act on.
+    fn pick_text_note(conn: &Connection) -> String {
+        let mut stmt = conn.prepare("SELECT noteId FROM notes WHERE type = 'text' AND isDeleted = 0").unwrap();
+        let ids: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().map(|x| x.unwrap()).collect();
+        ids.iter()
+            .find(|id| matches!(load_note(conn, id), Ok(Some(n)) if !n.is_protected))
+            .cloned()
+            .expect("no non-protected text note to run against")
+            .clone()
+    }
+
+    /// Upload → convert-to-note over a copy of a real database: a PNG upload lands as an
+    /// `image` attachment, converting it creates an image note under the same parent with the
+    /// same bytes, the attachment is soft-deleted, and a text parent's content is re-pointed
+    /// at the new note.
+    #[test]
+    fn upload_and_convert_attachment_to_note() {
+        let Ok(src) = std::env::var("TRILIUM_VERIFY_SOURCE") else {
+            eprintln!("TRILIUM_VERIFY_SOURCE not set; integration verification skipped");
+            return;
+        };
+        let conn = copy_db(&src);
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00\x00\x00\x00\x50";
+
+        let note_id = pick_text_note(&conn);
+
+        // Upload the picture: role `image`, blob holding PNG magic bytes.
+        let UploadedAttachment::Image { attachment_id, title } = save_uploaded_attachment(
+            &conn, &note_id, "photo.png", "image/png", png,
+        )
+        .unwrap()
+        else {
+            panic!("a PNG upload must take the image branch");
+        };
+        assert_eq!(title, "photo.png");
+        let (role, blob): (String, String) = conn
+            .query_row(
+                "SELECT a.role, a.blobId FROM attachments a WHERE a.attachmentId = ?1",
+                params![attachment_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(role, "image");
+        let stored: Vec<u8> = conn.query_row("SELECT content FROM blobs WHERE blobId = ?1", params![blob], |r| r.get(0)).unwrap();
+        assert!(stored.starts_with(b"\x89PNG"), "uploaded bytes must be stored verbatim");
+
+        // Reference the picture from the parent's content, as the editor would.
+        let content = format!(r#"<p>see <img src="api/attachments/{attachment_id}/image/photo.png"></p>"#);
+        update_note_data(&conn, &note_id, &content).unwrap();
+
+        // Convert: a new image note under the same parent, the attachment soft-deleted, and the
+        // parent's content re-pointed at `api/images/{newNoteId}/`.
+        let created = convert_attachment_to_note(&conn, &attachment_id).unwrap();
+        assert_eq!(created.parent_note_id, note_id);
+        let (note_type, is_protected, new_blob): (String, i64, String) = conn
+            .query_row(
+                "SELECT type, isProtected, blobId FROM notes WHERE noteId = ?1 AND isDeleted = 0",
+                params![created.note_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(note_type, "image");
+        assert_eq!(is_protected, 0);
+        let new_stored: Vec<u8> = conn.query_row("SELECT content FROM blobs WHERE blobId = ?1", params![new_blob], |r| r.get(0)).unwrap();
+        assert_eq!(new_stored, png, "converted note must hold the attachment bytes");
+        let branch_parent: String = conn
+            .query_row(
+                "SELECT parentNoteId FROM branches WHERE branchId = ?1",
+                params![created.branch_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(branch_parent, note_id);
+
+        let deleted: i64 = conn
+            .query_row("SELECT isDeleted FROM attachments WHERE attachmentId = ?1", params![attachment_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(deleted, 1, "the converted attachment must be marked deleted");
+
+        let final_content: String = conn
+            .query_row(
+                "SELECT b.content FROM blobs b JOIN notes n ON n.blobId = b.blobId WHERE n.noteId = ?1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            final_content.contains(&format!("api/images/{}/", created.note_id)),
+            "parent content must point at the new image note: {final_content}"
+        );
+        assert!(!final_content.contains(&format!("api/attachments/{attachment_id}/image/")), "old attachment URL must be gone");
+
+        eprintln!("upload+convert verification passed (note {}, image note {})", note_id, created.note_id);
+    }
+
+    /// Multipart file routes over a copy of a real database: `PUT attachments/{id}/file`
+    /// replaces the bytes (mime included), and `PUT notes/{id}/file` writes the file over a
+    /// note's content and stamps `originalFileName`.
+    #[test]
+    fn upload_file_routes_replace_content() {
+        let Ok(src) = std::env::var("TRILIUM_VERIFY_SOURCE") else {
+            eprintln!("TRILIUM_VERIFY_SOURCE not set; integration verification skipped");
+            return;
+        };
+        let conn = copy_db(&src);
+        let note_id = pick_text_note(&conn);
+        let bytes = b"hello file content".to_vec();
+
+        // `PUT notes/{id}/file` (no replace): content written, `originalFileName` label set, mime lowercased.
+        update_file_note(&conn, &note_id, "greeting.txt", "Text/Plain", &bytes, false).unwrap();
+        let mime: String = conn.query_row("SELECT mime FROM notes WHERE noteId = ?1", params![note_id], |r| r.get(0)).unwrap();
+        assert_eq!(mime, "text/plain");
+        let stored: String = conn
+            .query_row("SELECT b.content FROM blobs b JOIN notes n ON n.blobId = b.blobId WHERE n.noteId = ?1", params![note_id], |r| r.get(0))
+            .unwrap();
+        assert!(stored.contains("hello file content"), "note content must hold the upload");
+        let labeled: Option<String> = conn
+            .query_row(
+                "SELECT value FROM attributes WHERE noteId = ?1 AND type = 'label' AND name = 'originalFileName' AND isDeleted = 0",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(labeled.as_deref(), Some("greeting.txt"));
+        // A revision snapshot was taken before the overwrite.
+        let revisions: i64 = conn.query_row("SELECT COUNT(*) FROM revisions WHERE noteId = ?1", params![note_id], |r| r.get(0)).unwrap();
+        assert!(revisions >= 1, "a non-replace file upload must snapshot first");
+
+        // `PUT attachments/{id}/file`: pick any surviving attachment and replace its bytes.
+        let attachment: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT attachmentId, isProtected FROM attachments WHERE ownerId = ?1 AND isDeleted = 0 AND blobId IS NOT NULL LIMIT 1",
+                params![note_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        if let Some((attachment_id, protected)) = attachment {
+            if protected == 0 {
+                let replacement = b"replacement bytes".to_vec();
+                update_file_attachment(&conn, &attachment_id, "application/x-bin", &replacement).unwrap();
+                let (mime, blob): (String, String) = conn
+                    .query_row(
+                        "SELECT mime, blobId FROM attachments WHERE attachmentId = ?1",
+                        params![attachment_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(mime, "application/x-bin");
+                let stored: Vec<u8> = conn.query_row("SELECT content FROM blobs WHERE blobId = ?1", params![blob], |r| r.get(0)).unwrap();
+                assert_eq!(stored, replacement, "attachment blob must hold the replacement");
+            }
+        }
+        eprintln!("file-route verification passed for note {note_id}");
     }
 }

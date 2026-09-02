@@ -14,6 +14,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, State};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use chrono::{Duration, Utc};
 use rand::Rng;
 
@@ -76,7 +78,24 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
         return match segments.as_slice() {
             ["notes", note_id, "protect", protect] => protect_note(conn, app, note_id, protect, query),
             ["notes", note_id, "data"] => put_note_data(conn, note_id, data),
+            ["notes", note_id, "file"] => update_file_route(conn, note_id, query, data),
+            ["attachments", attachment_id, "rename"] => rename_attachment_route(conn, attachment_id, data),
+            ["attachments", attachment_id, "file"] => update_attachment_file_route(conn, attachment_id, data),
+            ["images", note_id] => update_image_route(conn, note_id, data),
             _ => Err(not_found(&format!("No route for PUT {url}"))),
+        };
+    }
+
+    if method == "DELETE" {
+        return match segments.as_slice() {
+            ["attachments", attachment_id] => {
+                db::write::delete_attachment(conn, attachment_id).map_err(|err| ApiError {
+                    status: err.status,
+                    message: err.message,
+                })?;
+                Ok(json!({}))
+            }
+            _ => Err(not_found(&format!("No route for DELETE {url}"))),
         };
     }
 
@@ -89,6 +108,9 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
             // rows older than 24h; keep that on a small probability to avoid a write
             // on every keystroke when a note is opened once.
             ["recent-notes"] => add_recent_note(conn, data),
+            ["notes", note_id, "attachments"] => save_note_attachment(conn, note_id, data, query),
+            ["notes", note_id, "attachments", "upload"] => upload_attachments_route(conn, note_id, data),
+            ["attachments", attachment_id, "convert-to-note"] => convert_attachment_to_note_route(conn, attachment_id),
             ["login", "protected"] => login_protected(conn, app, data),
             ["login", "protected", "touch"] => touch_protected(),
             ["logout", "protected"] => logout_protected(app),
@@ -115,6 +137,10 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
             get_blob(conn, note_id)
         }
         ["notes", note_id, "attachments"] => get_attachments(conn, note_id),
+        ["attachments", attachment_id, "all"] => get_all_attachments(conn, attachment_id),
+        ["attachments", attachment_id, "blob"] => get_attachment_blob_route(conn, attachment_id),
+        ["attachments", attachment_id, "image-info"] => get_attachment_image_info(conn, attachment_id),
+        ["attachments", attachment_id] => get_attachment_route(conn, attachment_id),
         ["notes", note_id, "metadata"] => get_note_metadata(conn, note_id),
         ["note-map", note_id, "backlink-count"] => get_backlink_count(conn, note_id),
         ["notes", note_id] => get_note(conn, note_id),
@@ -388,28 +414,361 @@ fn get_attachments(conn: &rusqlite::Connection, note_id: &str) -> Result<Value, 
         message: format!("failed to load attachments: {err}"),
     })?;
 
-    let rows: Vec<Value> = attachments
-        .into_iter()
-        .map(|a| {
-            json!({
-                "attachmentId": a.attachment_id,
-                "ownerId": a.owner_id,
-                "role": a.role,
-                "mime": a.mime,
-                "title": session::title_or_mask(a.is_protected, a.title),
-                "position": a.position,
-                "blobId": a.blob_id,
-                "isProtected": a.is_protected,
-                "isDeleted": false,
-                "contentLength": a.content_length,
-                "dateModified": a.date_modified,
-                "utcDateModified": a.utc_date_modified,
-                "utcDateScheduledForErasureSince": a.utc_date_scheduled_for_erasure_since,
-            })
-        })
-        .collect();
-
+    let rows: Vec<Value> = attachments.into_iter().map(|a| attachment_row_value(&a)).collect();
     Ok(Value::Array(rows))
+}
+
+/// `GET /attachments/{id}` — one attachment as `FAttachmentRow`.
+fn get_attachment_route(conn: &rusqlite::Connection, attachment_id: &str) -> Result<Value, ApiError> {
+    let attachment = db::get_attachment(conn, attachment_id)
+        .map_err(|err| ApiError { status: 500, message: format!("failed to load attachment: {err}") })?
+        .ok_or_else(|| not_found(&format!("Attachment '{}' not found", attachment_id)))?;
+    Ok(attachment_row_value(&attachment))
+}
+
+/// `GET /attachments/{id}/all` — every attachment of the note that owns the
+/// requested one (the attachments panel loads them in one go).
+fn get_all_attachments(conn: &rusqlite::Connection, attachment_id: &str) -> Result<Value, ApiError> {
+    let attachment = db::get_attachment(conn, attachment_id)
+        .map_err(|err| ApiError { status: 500, message: format!("failed to load attachment: {err}") })?
+        .ok_or_else(|| not_found(&format!("Attachment '{}' not found", attachment_id)))?;
+
+    let attachments = db::get_note_attachments(conn, &attachment.owner_id).map_err(|err| ApiError {
+        status: 500,
+        message: format!("failed to load attachments: {err}"),
+    })?;
+    let rows: Vec<Value> = attachments.into_iter().map(|a| attachment_row_value(&a)).collect();
+    Ok(Value::Array(rows))
+}
+
+/// One attachment serialized as the client's `FAttachmentRow` (titles decrypted
+/// or masked according to the protected-session state).
+fn attachment_row_value(a: &db::AttachmentInfo) -> Value {
+    json!({
+        "attachmentId": a.attachment_id,
+        "ownerId": a.owner_id,
+        "role": a.role,
+        "mime": a.mime,
+        "title": session::title_or_mask(a.is_protected, a.title.clone()),
+        "position": a.position,
+        "blobId": a.blob_id,
+        "isProtected": a.is_protected,
+        "isDeleted": false,
+        "contentLength": a.content_length,
+        "dateModified": a.date_modified,
+        "utcDateModified": a.utc_date_modified,
+        "utcDateScheduledForErasureSince": a.utc_date_scheduled_for_erasure_since,
+    })
+}
+
+/// `GET /attachments/{id}/blob` — the blob pojo. Attachments hold binary
+/// content, so `content` is `null` and only the length/timestamps travel,
+/// mirroring `getBlobPojo` for non-string entities.
+fn get_attachment_blob_route(conn: &rusqlite::Connection, attachment_id: &str) -> Result<Value, ApiError> {
+    let blob = db::get_attachment_blob(conn, attachment_id)
+        .map_err(|err| ApiError { status: 500, message: format!("failed to load attachment blob: {err}") })?
+        .ok_or_else(|| not_found(&format!("Attachment '{}' not found", attachment_id)))?;
+    Ok(json!({
+        "blobId": blob.blob_id,
+        "content": null,
+        "contentLength": blob.content_length,
+        "dateModified": blob.date_modified,
+        "utcDateModified": blob.utc_date_modified,
+        "isStubbed": false,
+        "textRepresentation": null,
+    }))
+}
+
+/// `POST /notes/{id}/attachments` — `note.saveAttachment({attachmentId, role,
+/// mime, title, content}, matchBy)`. Binary content travels base64-encoded
+/// (JSON cannot carry Uint8Array); an absent `content` force-writes an empty
+/// blob like the real service.
+fn save_note_attachment(
+    conn: &rusqlite::Connection,
+    note_id: &str,
+    data: &Option<Value>,
+    query: &str,
+) -> Result<Value, ApiError> {
+    let Some(payload) = data else {
+        return Err(bad_request("Missing payload for notes/{id}/attachments"));
+    };
+    let attachment_id = payload.get("attachmentId").and_then(Value::as_str);
+    let role = payload.get("role").and_then(Value::as_str).unwrap_or("file");
+    let mime = payload.get("mime").and_then(Value::as_str).unwrap_or("application/octet-stream");
+    let title = payload.get("title").and_then(Value::as_str).unwrap_or("attachment");
+    let content: Vec<u8> = payload
+        .get("content")
+        .and_then(Value::as_str)
+        .and_then(|b64| BASE64.decode(b64).ok())
+        .unwrap_or_default();
+    let match_by = match parse_param(query, "matchBy") {
+        Some("title") => Some("title"),
+        Some("attachmentId") | None => None, // attachmentId matching is the default
+        _ => None,
+    };
+
+    db::write::save_attachment_route(conn, note_id, attachment_id, role, mime, title, Some(content), match_by)
+        .map_err(|err| ApiError {
+            status: err.status,
+            message: err.message,
+        })?;
+    Ok(json!({}))
+}
+
+/// `PUT /attachments/{id}/rename` — `renameAttachment`, non-empty title.
+fn rename_attachment_route(conn: &rusqlite::Connection, attachment_id: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+    let title = data
+        .as_ref()
+        .and_then(|v| v.get("title"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad_request("Missing 'title' in payload"))?;
+
+    db::write::rename_attachment(conn, attachment_id, title).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+    Ok(json!({}))
+}
+
+// ---------------------------------------------------------------------------
+// Multipart uploads — the `server.upload` routes (`POST notes/{id}/attachments/upload`,
+// `PUT notes/{id}/file`, `PUT attachments/{id}/file`, `PUT images/{id}`). The client's
+// desktop-shell `upload()` base64-encodes the file into this payload instead of sending
+// multipart/form-data, so the "uploaded" response shape below matches what the FormData
+// branch of the HTTP builds and the real routes answer with.
+// ---------------------------------------------------------------------------
+
+/// Parse the `server.upload` IPC payload (`{ fileName, mimeType, content: base64 }`) into
+/// the file fields the upload routes consume. `None` when the payload carries no content —
+/// the uploaded-file routes answer `{ uploaded: false, message }` for that, exactly like the
+/// real multipart middleware seeing no file.
+fn parse_upload_payload(data: &Option<Value>) -> Option<(String, String, Vec<u8>)> {
+    let payload = data.as_ref()?;
+    let content = payload.get("content").and_then(Value::as_str)?;
+    let bytes = BASE64.decode(content.as_bytes()).ok()?;
+    let original_name = payload.get("fileName").and_then(Value::as_str).unwrap_or("file").to_string();
+    let mime = payload.get("mimeType").and_then(Value::as_str).unwrap_or("application/octet-stream").to_string();
+    Some((original_name, mime, bytes))
+}
+
+/// `POST /notes/{noteId}/attachments/upload` — image attachments answer with their serving
+/// URL, everything else with an attachments-panel reference, mirroring `uploadAttachment`.
+fn upload_attachments_route(conn: &rusqlite::Connection, note_id: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+    let Some((original_name, mime, content)) = parse_upload_payload(data) else {
+        return Ok(json!({ "uploaded": false, "message": "Missing attachment data." }));
+    };
+
+    let uploaded = db::write::save_uploaded_attachment(conn, note_id, &original_name, &mime, &content)
+        .map_err(|err| ApiError { status: err.status, message: err.message })?;
+    let url = match uploaded {
+        db::write::UploadedAttachment::Image { attachment_id, title } => {
+            format!("api/attachments/{attachment_id}/image/{}", db::write::encode_uri_component(&title))
+        }
+        db::write::UploadedAttachment::File { attachment_id } => {
+            format!("#root/{note_id}?viewMode=attachments&attachmentId={attachment_id}")
+        }
+    };
+    Ok(json!({ "uploaded": true, "url": url }))
+}
+
+/// `PUT /notes/{noteId}/file` — `replace=1` skips the revision snapshot; the response is
+/// the `{ uploaded: true }` the client's update-file callers expect.
+fn update_file_route(conn: &rusqlite::Connection, note_id: &str, query: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+    let Some((original_name, mime, content)) = parse_upload_payload(data) else {
+        return Ok(json!({ "uploaded": false, "message": "Missing file." }));
+    };
+    let replace = parse_param(query, "replace").map(|v| v == "1").unwrap_or(false);
+
+    db::write::update_file_note(conn, note_id, &original_name, &mime, &content, replace).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+    Ok(json!({ "uploaded": true }))
+}
+
+/// `PUT /attachments/{attachmentId}/file` — upload a new revision of an attachment's file.
+fn update_attachment_file_route(conn: &rusqlite::Connection, attachment_id: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+    let Some((_original_name, mime, content)) = parse_upload_payload(data) else {
+        return Ok(json!({ "uploaded": false, "message": "Missing file." }));
+    };
+
+    db::write::update_file_attachment(conn, attachment_id, &mime, &content).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+    Ok(json!({ "uploaded": true }))
+}
+
+/// `PUT /images/{noteId}` — replace an image note's content.
+fn update_image_route(conn: &rusqlite::Connection, note_id: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+    let Some((original_name, _mime, content)) = parse_upload_payload(data) else {
+        return Ok(json!({ "uploaded": false, "message": "Missing file." }));
+    };
+
+    db::write::update_image_note(conn, note_id, &original_name, &content).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+    Ok(json!({ "uploaded": true }))
+}
+
+/// `POST /attachments/{attachmentId}/convert-to-note` — the new note's place in the tree,
+/// as the `ConvertAttachmentToNoteResponse` the attachment panel opens.
+fn convert_attachment_to_note_route(conn: &rusqlite::Connection, attachment_id: &str) -> Result<Value, ApiError> {
+    let created = db::write::convert_attachment_to_note(conn, attachment_id).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+
+    let note = db::get_note(conn, &created.note_id).ok_or_else(|| not_found(&format!("Note '{}' not found", created.note_id)))?;
+    Ok(json!({
+        "note": {
+            "noteId": note.note_id,
+            "title": session::title_or_mask(note.is_protected, note.title),
+            "isProtected": note.is_protected,
+            "type": note.note_type,
+            "mime": note.mime,
+            "blobId": note.blob_id,
+        },
+        "branch": {
+            "branchId": created.branch_id,
+            "noteId": created.note_id,
+            "parentNoteId": created.parent_note_id,
+            "notePosition": created.note_position,
+            "prefix": "",
+            "isExpanded": false,
+        }
+    }))
+}
+
+/// `GET /attachments/{id}/image-info` — the shape the image-compression dialog
+/// opens with. Only the format and dimensions are inspected here; the bit-depth
+/// / channel / quality metrics the real `inspectImage` derives are reported as
+/// unknown.
+fn get_attachment_image_info(conn: &rusqlite::Connection, attachment_id: &str) -> Result<Value, ApiError> {
+    let attachment = db::get_attachment(conn, attachment_id)
+        .map_err(|err| ApiError { status: 500, message: format!("failed to load attachment: {err}") })?
+        .ok_or_else(|| not_found(&format!("Attachment '{}' not found", attachment_id)))?;
+    if attachment.role != "image" {
+        return Err(ApiError {
+            status: 400,
+            message: format!(
+                "Attachment '{}' has role '{}', but 'image' was expected",
+                attachment_id, attachment.role
+            ),
+        });
+    }
+
+    let Some((raw, is_protected)) = db::get_attachment_content(conn, attachment_id).map_err(|err| ApiError {
+        status: 500,
+        message: format!("failed to load attachment content: {err}"),
+    })?
+    else {
+        return Err(not_found(&format!("Attachment '{}' not found", attachment_id)));
+    };
+    if is_protected && !session::is_available() {
+        return Err(ApiError {
+            status: 403,
+            message: format!("Content of '{attachment_id}' is protected and no protected session is open."),
+        });
+    }
+    let bytes = if is_protected {
+        session::decrypt_bytes(&String::from_utf8_lossy(&raw)).unwrap_or_default()
+    } else {
+        raw
+    };
+
+    let (format, width, height) = inspect_image_geometry(&bytes);
+    let detected_mime = match format {
+        "png" => "image/png",
+        "jpg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "unknown",
+    };
+
+    Ok(json!({
+        "entityType": "attachment",
+        "entityId": attachment_id,
+        "title": session::title_or_mask(attachment.is_protected, attachment.title),
+        "mime": attachment.mime,
+        "format": format,
+        "detectedMime": detected_mime,
+        "size": bytes.len(),
+        "width": width,
+        "height": height,
+        "bitDepth": null,
+        "channels": null,
+        "hasAlpha": null,
+        "indexed": null,
+        "quality": null,
+        "compressible": matches!(format, "png" | "jpg" | "webp"),
+    }))
+}
+
+/// The format and pixel dimensions of an image, read off its header — a light
+/// stand-in for `inspectImage` (PNG IHDR, GIF logical screen, JPEG SOF scan,
+/// WebP/BMP headers supported; the JPEG quality / PNG color-type depth are not).
+fn inspect_image_geometry(bytes: &[u8]) -> (&'static str, Option<u32>, Option<u32>) {
+    if bytes.len() >= 24 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" && &bytes[12..16] == b"IHDR" {
+        let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        return ("png", Some(w), Some(h));
+    }
+    if bytes.len() >= 10 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") {
+        let w = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as u32;
+        let h = u16::from_le_bytes(bytes[8..10].try_into().unwrap()) as u32;
+        return ("gif", Some(w), Some(h));
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        if let Some((w, h)) = jpeg_sof_dimensions(bytes) {
+            return ("jpg", Some(w), Some(h));
+        }
+        return ("jpg", None, None);
+    }
+    if bytes.len() >= 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return ("webp", None, None);
+    }
+    if bytes.len() >= 26 && &bytes[..2] == b"BM" {
+        let w = u32::from_le_bytes(bytes[18..22].try_into().unwrap());
+        let h = u32::from_le_bytes(bytes[22..26].try_into().unwrap());
+        return ("bmp", Some(w), Some(h));
+    }
+    ("unknown", None, None)
+}
+
+/// Walk the JPEG segment table for a SOF marker, which carries the height and
+/// width just after the 2-byte length field.
+fn jpeg_sof_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2usize;
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = bytes[i + 1];
+        // Standalone markers (RST/DHT/SOS/etc.) carry no length; a stuffed 0xFF
+        // after a marker byte is part of the data.
+        if marker == 0xFF || marker == 0x00 || (0xD0..=0xD9).contains(&marker) {
+            i += 1;
+            continue;
+        }
+        let seg_len = u16::from_be_bytes(bytes[i + 2..i + 4].try_into().unwrap()) as usize;
+        if seg_len < 2 || i + 2 + seg_len > bytes.len() {
+            return None;
+        }
+        if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) && seg_len >= 8 {
+            if i + 9 > bytes.len() {
+                return None;
+            }
+            let h = u16::from_be_bytes(bytes[i + 5..i + 7].try_into().unwrap()) as u32;
+            let w = u16::from_be_bytes(bytes[i + 7..i + 9].try_into().unwrap()) as u32;
+            return Some((w, h));
+        }
+        i += 2 + seg_len;
+    }
+    None
 }
 
 /// `GET /autocomplete` — with an empty `query` this lists recent notes (the
@@ -661,5 +1020,31 @@ fn bad_request(message: &str) -> ApiError {
     ApiError {
         status: 400,
         message: message.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_geometry_reads_png_gif_jpeg_headers() {
+        // Minimal PNG: signature + IHDR with 127x80.
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.extend_from_slice(&[0x00, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x00, 0x50]);
+        assert_eq!(inspect_image_geometry(&png), ("png", Some(127), Some(80)));
+
+        // GIF89a logical screen 320x200, little-endian.
+        let gif = [b'G', b'I', b'F', b'8', b'9', b'a', 0x40, 0x01, 0xC8, 0x00];
+        assert_eq!(inspect_image_geometry(&gif), ("gif", Some(320), Some(200)));
+
+        // JPEG: SOI followed directly by a full SOF0 (length 10) carrying 250x100.
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0A, 0x08, 0x00, 0x64, 0x00, 0xFA, 0x01, 0x11, 0x22,
+        ];
+        assert_eq!(inspect_image_geometry(&jpeg), ("jpg", Some(250), Some(100)));
+
+        // Anything else stays unclassified.
+        assert_eq!(inspect_image_geometry(b"not an image"), ("unknown", None, None));
     }
 }
