@@ -12,9 +12,15 @@
 //!   matches `AbstractBeccaEntity.generateHash`: base64-sha1 over the `|`-joined
 //!   hashed properties, truncated to 10 chars (`+deleted` suffix for soft deletes).
 //!
-//! Deferred in this vertical slice (separate subsystems): OCR `textRepresentation`, and content
-//! encryption for protected notes (protected notes are refused here). Remote image download and
-//! image-attachment orphan cleanup are implemented; image recompression/shrinking is not.
+//! Protected notes are supported end-to-end: content is encrypted at rest with the
+//! protected-session data key (AES-128-CBC, see `crypto`), the title is encrypted
+//! with it too, and blob ids are always hashed against the `_ENCRYPTED_`-prefixed
+//! plaintext so an encrypted entity never shares a blob with its plaintext twin.
+//! `protect_note` flips the flag over a note, its revisions and its attachments.
+//!
+//! Deferred in this vertical slice (separate subsystems): OCR `textRepresentation`
+//! writing on regular saves, and image recompression/shrinking. Remote image
+//! download and image-attachment orphan cleanup are implemented.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -30,6 +36,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha512;
 use unicode_normalization::UnicodeNormalization;
+
+use crate::services::protected_session as session;
 
 /// A database error in the write path, surfaced to the caller as an HTTP-style error.
 #[derive(Debug)]
@@ -72,7 +80,7 @@ const BLOB_POOL: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 
 /// Generate a random id of `[A-Za-z0-9]` of the given length, matching `randtoken` in
 /// the real server (note ids, attribute ids, change ids are all this shape).
-fn random_string(length: usize) -> String {
+pub fn random_string(length: usize) -> String {
     let mut rng = rand::thread_rng();
     (0..length)
         .map(|_| BLOB_POOL[rng.gen_range(0..BLOB_POOL.len())] as char)
@@ -116,6 +124,35 @@ fn hashed_blob_id(content: &str) -> String {
     hashed_blob_id_bytes(content.as_bytes())
 }
 
+/// Whether the given note type/mime stores its content as a string (TEXT) rather
+/// than binary bytes — `utils.isStringNote` for the note types this shell writes.
+fn is_string_note(note_type: &str, mime: &str) -> bool {
+    matches!(
+        note_type,
+        "text" | "code" | "render" | "relationMap" | "llmChat" | "spreadsheet" | "canvas" | "mindMap" | "contentWidget"
+    ) || mime.starts_with("text/")
+}
+
+/// `getUnencryptedContentForHashCalculation` twin: a protected entity's blob id
+/// is hashed over the `_ENCRYPTED_`-prefixed plaintext, so ciphertext never
+/// shares a blob id with the same plaintext elsewhere.
+pub fn blob_id_for(is_protected: bool, clear: &[u8]) -> String {
+    if is_protected {
+        let mut prefixed = Vec::with_capacity(clear.len() + crate::crypto::ENCRYPTED_PREFIX.len());
+        prefixed.extend_from_slice(crate::crypto::ENCRYPTED_PREFIX.as_bytes());
+        prefixed.extend_from_slice(clear);
+        hashed_blob_id_bytes(&prefixed)
+    } else {
+        hashed_blob_id_bytes(clear)
+    }
+}
+
+/// `Uint8Array.toString()` twin: join the bytes with commas, as the real server
+/// feeds binary blob content into `calculateContentHash`.
+fn comma_joined(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+}
+
 /// The blob content as stored in the `blobs.content` column: string notes go in as
 /// TEXT (so the client reads them back as strings), attachment bytes as BLOB.
 enum BlobContent<'a> {
@@ -132,6 +169,7 @@ fn local_now() -> String {
 }
 
 /// The note's editable fields plus the timestamps the write path needs.
+#[derive(Clone)]
 struct WriteNote {
     note_id: String,
     title: String,
@@ -482,6 +520,8 @@ fn strip_stale_srcset(content: &str) -> String {
 /// Save one attachment of a note: a content blob (binary) plus an `attachments` row and its
 /// entity change. `role` describes what created the attachment ("file" for a plain inline
 /// attachment, "image" for a stored picture); see `AttachmentRoleTraits` in the real server.
+/// For a protected note the content is encrypted and the title is encrypted too — both
+/// exactly as the real `BAttachment` stores them.
 fn save_attachment(
     conn: &Connection,
     owner_id: &str,
@@ -494,10 +534,26 @@ fn save_attachment(
     utc: &str,
 ) -> rusqlite::Result<String> {
     let attachment_id = random_string(12);
-    let blob_id = hashed_blob_id_bytes(content);
-    // `Uint8Array.toString()` joins the bytes with commas; `calculateContentHash` uses it.
-    let hash_str = content.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
-    insert_blob(conn, &blob_id, BlobContent::Bytes(content), &hash_str, local, utc)?;
+
+    // Protected content is stored as the UTF-8 bytes of the base64 ciphertext;
+    // the blob id is hashed over the `_ENCRYPTED_`-prefixed plaintext.
+    let (blob_id, stored, hash_str): (String, Vec<u8>, String) = if is_protected {
+        let encrypted = session::encrypt(content).ok_or(rusqlite::Error::InvalidQuery)?;
+        let stored = encrypted.into_bytes();
+        let hash_str = comma_joined(&stored);
+        (blob_id_for(true, content), stored, hash_str)
+    } else {
+        let hash_str = comma_joined(content);
+        (hashed_blob_id_bytes(content), content.to_vec(), hash_str)
+    };
+    insert_blob(conn, &blob_id, BlobContent::Bytes(&stored), &hash_str, local, utc)?;
+
+    // Attachment titles are encrypted at rest while the attachment is protected.
+    let stored_title = if is_protected {
+        session::encrypt_string(title).ok_or(rusqlite::Error::InvalidQuery)?
+    } else {
+        title.to_string()
+    };
 
     let max_position: i64 = conn.query_row(
         "SELECT COALESCE(MAX(position), 0) FROM attachments WHERE ownerId = ?1 AND isDeleted = 0",
@@ -510,13 +566,13 @@ fn save_attachment(
          (attachmentId, ownerId, role, mime, title, isProtected, position, blobId, dateModified, \
           utcDateModified, utcDateScheduledForErasureSince, isDeleted, deleteId) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, 0, NULL)",
-        params![attachment_id, owner_id, role, mime, title, protected, max_position + 10, blob_id, local, utc],
+        params![attachment_id, owner_id, role, mime, stored_title, protected, max_position + 10, blob_id, local, utc],
     )?;
 
     // Attachment hashed properties, in order: attachmentId, ownerId, role, mime, title,
     // blobId, utcDateScheduledForErasureSince. A fresh attachment has the last one unset,
     // which serializes as the literal `undefined`.
-    let hash_input = format!("|{attachment_id}|{owner_id}|{role}|{mime}|{title}|{blob_id}|undefined");
+    let hash_input = format!("|{attachment_id}|{owner_id}|{role}|{mime}|{stored_title}|{blob_id}|undefined");
     put_entity_change(conn, "attachments", &attachment_id, &hash10(&hash_input), utc)?;
     Ok(attachment_id)
 }
@@ -830,8 +886,18 @@ fn set_attachment_erasure(
 }
 
 /// Copy a foreign attachment (referenced from this note's content but owned by another) into this
-/// note under `role`, pointing at the same blob. Mirrors `BAttachment.copy()`.
-fn copy_attachment(conn: &Connection, note_id: &str, role: &str, mime: &str, title: &str, blob_id: &str) -> rusqlite::Result<String> {
+/// note under `role`, pointing at the same blob. Mirrors `BAttachment.copy()`, which keeps the
+/// source attachment's protection state and title verbatim (so a copy from an unprotected note
+/// stays plain even when the referencing note is protected).
+fn copy_attachment(
+    conn: &Connection,
+    note_id: &str,
+    role: &str,
+    mime: &str,
+    title: &str,
+    blob_id: &str,
+    is_protected: bool,
+) -> rusqlite::Result<String> {
     let attachment_id = random_string(12);
     let local = local_now();
     let utc = utc_now();
@@ -840,17 +906,13 @@ fn copy_attachment(conn: &Connection, note_id: &str, role: &str, mime: &str, tit
         params![note_id],
         |row| row.get(0),
     )?;
-    let is_protected: i64 = conn.query_row(
-        "SELECT isProtected FROM notes WHERE noteId = ?1",
-        params![note_id],
-        |row| row.get(0),
-    )?;
+    let protected: i64 = i64::from(is_protected);
     conn.execute(
         "INSERT INTO attachments \
          (attachmentId, ownerId, role, mime, title, isProtected, position, blobId, dateModified, \
           utcDateModified, utcDateScheduledForErasureSince, isDeleted, deleteId) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, 0, NULL)",
-        params![attachment_id, note_id, role, mime, title, is_protected, max_position + 10, blob_id, local, utc],
+        params![attachment_id, note_id, role, mime, title, protected, max_position + 10, blob_id, local, utc],
     )?;
     let hash_input = format!("|{attachment_id}|{note_id}|{role}|{mime}|{title}|{blob_id}|undefined");
     put_entity_change(conn, "attachments", &attachment_id, &hash10(&hash_input), &utc)?;
@@ -921,16 +983,16 @@ fn check_image_attachments(conn: &Connection, note_id: &str, is_markdown: bool, 
 
     let mut content = content.to_string();
     for unknown_id in &unknown_ids {
-        let foreign: Option<(String, String, String, Option<String>, String)> = conn
+        let foreign: Option<(String, String, String, Option<String>, String, bool)> = conn
             .query_row(
-                "SELECT a.role, a.mime, a.title, a.blobId, a.ownerId \
+                "SELECT a.role, a.mime, a.title, a.blobId, a.ownerId, a.isProtected \
                  FROM attachments a JOIN notes n ON n.noteId = a.ownerId \
                  WHERE a.attachmentId = ?1 AND a.isDeleted = 0 AND n.isDeleted = 0",
                 params![unknown_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, i64>(5)? != 0)),
             )
             .optional()?;
-        let Some((foreign_role, foreign_mime, foreign_title, Some(foreign_blob), foreign_owner)) = foreign else {
+        let Some((foreign_role, foreign_mime, foreign_title, Some(foreign_blob), foreign_owner, foreign_protected)) = foreign else {
             continue;
         };
 
@@ -961,7 +1023,7 @@ fn check_image_attachments(conn: &Connection, note_id: &str, is_markdown: bool, 
             }
             existing
         } else {
-            copy_attachment(conn, note_id, &copied_role, &foreign_mime, &foreign_title, &foreign_blob)?
+            copy_attachment(conn, note_id, &copied_role, &foreign_mime, &foreign_title, &foreign_blob, foreign_protected)?
         };
 
         // Rewrite every reference — image URLs and reference links alike.
@@ -1176,7 +1238,9 @@ pub fn update_note_data(conn: &Connection, note_id: &str, content: &str) -> Resu
     let Some(pre_note) = pre else {
         return Err(WriteError::not_found(note_id));
     };
-    if pre_note.is_protected {
+    // Editing a protected note requires the decrypted session (saving would otherwise overwrite
+    // the ciphertext with plaintext); `isContentAvailable` gates this in the real server too.
+    if pre_note.is_protected && !session::is_available() {
         return Err(WriteError::unavailable(note_id));
     }
     let downloaded: HashMap<String, Vec<u8>> = if pre_note.note_type == "text" {
@@ -1192,8 +1256,8 @@ pub fn update_note_data(conn: &Connection, note_id: &str, content: &str) -> Resu
             return Err(rusqlite::Error::QueryReturnedNoRows); // mapped to 404 below
         };
 
-        // Protected content has no decrypted write path yet in this shell.
-        if note.is_protected {
+        // Same protected gate, re-checked inside the transaction.
+        if note.is_protected && !session::is_available() {
             return Err(rusqlite::Error::InvalidQuery); // mapped to 400 below
         }
 
@@ -1206,10 +1270,17 @@ pub fn update_note_data(conn: &Connection, note_id: &str, content: &str) -> Resu
         let new_content = save_links(conn, &note, content, &downloaded)?;
 
         // setContent: dedup blob, point the note at it, delete the old one if unused.
-        let new_blob_id = hashed_blob_id(&new_content);
+        // A protected note's blob holds the encrypted content (TEXT), and its blob id is hashed
+        // over the `_ENCRYPTED_`-prefixed plaintext.
+        let (new_blob_id, stored, hash_str): (String, String, String) = if note.is_protected {
+            let encrypted = session::encrypt_string(&new_content).ok_or(rusqlite::Error::InvalidQuery)?;
+            (blob_id_for(true, new_content.as_bytes()), encrypted.clone(), encrypted)
+        } else {
+            (hashed_blob_id(&new_content), new_content.clone(), new_content.clone())
+        };
         let local = local_now();
         let utc = utc_now();
-        insert_blob(conn, &new_blob_id, BlobContent::Text(&new_content), &new_content, &local, &utc)?;
+        insert_blob(conn, &new_blob_id, BlobContent::Text(&stored), &hash_str, &local, &utc)?;
 
         if note.blob_id.as_deref() != Some(new_blob_id.as_str()) {
             let old_blob_id = note.blob_id.take();
@@ -1242,9 +1313,293 @@ pub fn update_note_data(conn: &Connection, note_id: &str, content: &str) -> Resu
     }
 }
 
+// ---------------------------------------------------------------------------
+// Protect / unprotect — `protectNote`, `protectNoteRecursively` and
+// `revisionService.protectRevisions` in one transaction.
+// ---------------------------------------------------------------------------
+
+/// Flip `isProtected` over a note (and, with `subtree`, its whole descendant
+/// tree through the branch table), re-encrypting or re-decrypting the note's
+/// blob, every revision's blob and every attachment's blob — plus attachment and
+/// revision titles, which are encrypted at rest like note titles. Requires an
+/// active protected session; mirror of `noteService.protectNoteRecursively`.
+pub fn protect_note(conn: &Connection, note_id: &str, protect: bool, subtree: bool) -> Result<(), WriteError> {
+    if !session::is_available() {
+        return Err(WriteError {
+            status: 400,
+            message: format!("Cannot (un)protect note '{}' without an active protected session", note_id),
+        });
+    }
+
+    let mut ids = Vec::new();
+    collect_note_and_descendants(conn, note_id, subtree, &mut ids).map_err(WriteError::from)?;
+
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> rusqlite::Result<()> {
+        for id in ids {
+            protect_one_note(conn, &id, protect)?;
+        }
+        Ok(())
+    })();
+    match run {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::from(err))
+        }
+    }
+}
+
+/// The note itself plus every descendant through non-deleted branches —
+/// `protectNoteRecursively` walks `getChildNotes` the same way.
+fn collect_note_and_descendants(conn: &Connection, note_id: &str, subtree: bool, out: &mut Vec<String>) -> rusqlite::Result<()> {
+    if !subtree {
+        out.push(note_id.to_string());
+        return Ok(());
+    }
+    // `branches.noteId` is the child note id; the recursion deduplicates clones.
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE sub(noteId) AS ( \
+           SELECT ?1 \
+           UNION \
+           SELECT b.noteId FROM branches b JOIN sub ON b.parentNoteId = sub.noteId AND b.isDeleted = 0 \
+         ) \
+         SELECT noteId FROM sub \
+         WHERE EXISTS (SELECT 1 FROM notes n WHERE n.noteId = sub.noteId AND n.isDeleted = 0)",
+    )?;
+    for row in stmt.query_map(params![note_id], |row| row.get::<_, String>(0))? {
+        out.push(row?);
+    }
+    Ok(())
+}
+
+/// Read a blob's stored bytes and, for a protected entity, decrypt them to the
+/// plaintext. Binary and TEXT storage both come back as bytes here.
+fn read_clear_bytes(conn: &Connection, blob_id: &str, was_protected: bool) -> rusqlite::Result<Vec<u8>> {
+    let stored: Option<Vec<u8>> = conn
+        .query_row("SELECT content FROM blobs WHERE blobId = ?1", params![blob_id], |row| row.get(0))
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(Vec::new());
+    };
+    if !was_protected {
+        return Ok(stored);
+    }
+    // Protected content is held as the UTF-8 bytes of the base64 ciphertext.
+    let cipher_text = String::from_utf8_lossy(&stored).into_owned();
+    Ok(session::decrypt_bytes(&cipher_text).unwrap_or_default())
+}
+
+/// Store entity content under the given protection: encrypt and prefix-hash when
+/// protected, store verbatim otherwise. Returns the (possibly already-existing)
+/// blob id.
+fn store_entity_content(
+    conn: &Connection,
+    is_protected: bool,
+    is_string: bool,
+    clear: &[u8],
+    local: &str,
+    utc: &str,
+) -> rusqlite::Result<String> {
+    let blob_id = blob_id_for(is_protected, clear);
+    let stored_bytes = if is_protected {
+        let encrypted = session::encrypt(clear).ok_or(rusqlite::Error::InvalidQuery)?;
+        encrypted.into_bytes()
+    } else {
+        clear.to_vec()
+    };
+    let text_form: Option<String> = is_string.then(|| String::from_utf8_lossy(&stored_bytes).into_owned());
+    let hash_str = text_form.as_ref().map_or_else(|| comma_joined(&stored_bytes), Clone::clone);
+    match text_form.as_deref() {
+        Some(text) => insert_blob(conn, &blob_id, BlobContent::Text(text), &hash_str, local, utc)?,
+        None => insert_blob(conn, &blob_id, BlobContent::Bytes(&stored_bytes), &hash_str, local, utc)?,
+    };
+    Ok(blob_id)
+}
+
+/// `readExtractedText` + `writeExtractedText` for the re-protect path: the OCR
+/// text is read off the old blob under the old protection and stored on the new
+/// blob under the new one. A blob that never held extracted text is untouched.
+fn migrate_text_representation(
+    conn: &Connection,
+    old_blob: &str,
+    new_blob: &str,
+    was_protected: bool,
+    now_protected: bool,
+) -> rusqlite::Result<()> {
+    let old_tr: Option<String> = conn
+        .query_row("SELECT textRepresentation FROM blobs WHERE blobId = ?1", params![old_blob], |row| row.get(0))
+        .optional()?;
+    let Some(tr) = old_tr.filter(|t| !t.is_empty()) else {
+        return Ok(());
+    };
+    let clear = if was_protected {
+        if session::is_available() {
+            session::decrypt_bytes(&tr)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        tr
+    };
+    if clear.is_empty() {
+        return Ok(());
+    }
+    let stored = if now_protected {
+        session::encrypt_string(&clear).ok_or(rusqlite::Error::InvalidQuery)?
+    } else {
+        clear
+    };
+    conn.execute("UPDATE blobs SET textRepresentation = ?1 WHERE blobId = ?2", params![stored, new_blob])?;
+    Ok(())
+}
+
+/// Flip protection on a single note: its row/blob, then its revisions, then its
+/// attachments — each entity written with its own (post-flip) entity change.
+fn protect_one_note(conn: &Connection, note_id: &str, protect: bool) -> rusqlite::Result<()> {
+    let Some(note) = load_note(conn, note_id)? else {
+        return Ok(()); // already erased — nothing to flip
+    };
+
+    // --- the note's own content ---
+    if note.is_protected != protect {
+        let mut updated = note.clone();
+        updated.is_protected = protect;
+        if let Some(old_blob) = updated.blob_id.take() {
+            let is_string = is_string_note(&updated.note_type, &updated.mime);
+            let content = read_clear_bytes(conn, &old_blob, note.is_protected)?;
+            let local = local_now();
+            let utc = utc_now();
+            let new_blob = store_entity_content(conn, protect, is_string, &content, &local, &utc)?;
+            migrate_text_representation(conn, &old_blob, &new_blob, note.is_protected, protect)?;
+            updated.blob_id = Some(new_blob.clone());
+            conn.execute(
+                "UPDATE notes SET isProtected = ?1, blobId = ?2, dateModified = ?3, utcDateModified = ?4 WHERE noteId = ?5",
+                params![i64::from(protect), new_blob, local, utc, note.note_id],
+            )?;
+            delete_blob_if_not_used(conn, &old_blob)?;
+        } else {
+            conn.execute(
+                "UPDATE notes SET isProtected = ?1 WHERE noteId = ?2",
+                params![i64::from(protect), note.note_id],
+            )?;
+        }
+        put_entity_change(conn, "notes", &note.note_id, &note_hash(&updated, false), &utc_now())?;
+    }
+
+    // --- revisions: `revisionService.protectRevisions` ---
+    {
+        let mut stmt = conn.prepare(
+            "SELECT revisionId, noteId, title, type, mime, isProtected, COALESCE(blobId, ''), \
+                    dateLastEdited, dateCreated, utcDateLastEdited, utcDateCreated, utcDateModified \
+             FROM revisions WHERE noteId = ?1",
+        )?;
+        let revisions: Vec<(String, String, String, String, String, i64, String, String, String, String, String, String)> = stmt
+            .query_map(params![note_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (revision_id, rev_note_id, title, rev_type, rev_mime, rev_protected_raw, rev_blob, date_last_edited, date_created, utc_date_last_edited, utc_date_created, utc_date_modified) in revisions {
+            let rev_protected = rev_protected_raw != 0;
+            if rev_protected == protect || rev_blob.is_empty() {
+                continue;
+            }
+            let content = read_clear_bytes(conn, &rev_blob, rev_protected)?;
+            let is_string = is_string_note(&rev_type, &rev_mime);
+            let local = local_now();
+            let utc = utc_now();
+            let new_blob = store_entity_content(conn, protect, is_string, &content, &local, &utc)?;
+            migrate_text_representation(conn, &rev_blob, &new_blob, rev_protected, protect)?;
+            conn.execute(
+                "UPDATE revisions SET isProtected = ?1, blobId = ?2, dateLastEdited = ?3, utcDateModified = ?4 WHERE revisionId = ?5",
+                params![i64::from(protect), new_blob, local, utc, revision_id],
+            )?;
+            // Revision hashed properties, in create_revision order.
+            let protected = if protect { "true" } else { "false" };
+            let hash_input = format!(
+                "{revision_id}|{rev_note_id}|{title}||auto|{protected}|{date_last_edited}|{date_created}|{utc_date_last_edited}|{utc_date_created}|{utc_date_modified}|{new_blob}"
+            );
+            put_entity_change(conn, "revisions", &revision_id, &hash10(&hash_input), &utc)?;
+            delete_blob_if_not_used(conn, &rev_blob)?;
+        }
+    }
+
+    // --- attachments ---
+    {
+        let mut stmt = conn.prepare(
+            "SELECT attachmentId, role, mime, title, isProtected, COALESCE(blobId, '') \
+             FROM attachments WHERE ownerId = ?1 AND isDeleted = 0",
+        )?;
+        let attachments: Vec<(String, String, String, String, i64, String)> = stmt
+            .query_map(params![note_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (attachment_id, role, mime, title, att_protected_raw, att_blob) in attachments {
+            let att_protected = att_protected_raw != 0;
+            if att_protected == protect || att_blob.is_empty() {
+                continue;
+            }
+            let content = read_clear_bytes(conn, &att_blob, att_protected)?;
+            let local = local_now();
+            let utc = utc_now();
+            let new_blob = store_entity_content(conn, protect, false, &content, &local, &utc)?;
+            migrate_text_representation(conn, &att_blob, &new_blob, att_protected, protect)?;
+            // Attachment titles are encrypted at rest, so flip them together.
+            let stored_title = if protect {
+                session::encrypt_string(&title).ok_or(rusqlite::Error::InvalidQuery)?
+            } else if att_protected {
+                session::decrypt_bytes(&title)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or(title)
+            } else {
+                title.clone()
+            };
+            conn.execute(
+                "UPDATE attachments SET isProtected = ?1, blobId = ?2, title = ?3, dateModified = ?4, \
+                        utcDateModified = ?5 WHERE attachmentId = ?6",
+                params![i64::from(protect), new_blob, stored_title, local, utc, attachment_id],
+            )?;
+            let scheduled: Option<String> = conn
+                .query_row(
+                    "SELECT utcDateScheduledForErasureSince FROM attachments WHERE attachmentId = ?1",
+                    params![attachment_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let scheduled_hash = scheduled.unwrap_or_else(|| "undefined".to_string());
+            let hash_input = format!("|{attachment_id}|{note_id}|{role}|{mime}|{stored_title}|{new_blob}|{scheduled_hash}");
+            put_entity_change(conn, "attachments", &attachment_id, &hash10(&hash_input), &utc)?;
+            delete_blob_if_not_used(conn, &att_blob)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::thread;
 

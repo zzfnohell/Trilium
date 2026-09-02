@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::services::protected_session as session;
+
 /// One note as serialized in the tree payload (`FNoteRow`).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -260,7 +262,9 @@ fn build_response(tree: &Tree, note_ids: &HashSet<String>) -> Option<serde_json:
         };
         notes.push(NoteRow {
             note_id: note.note_id.clone(),
-            title: note.title.clone(),
+            // `getTitleOrProtected`: protected titles are encrypted at rest, so a locked
+            // session shows the placeholder and an open one serves the decrypted title.
+            title: session::title_or_mask(note.is_protected, note.title.clone()),
             is_protected: note.is_protected,
             note_type: note.note_type.clone(),
             mime: note.mime.clone(),

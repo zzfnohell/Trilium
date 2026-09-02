@@ -210,16 +210,6 @@ pub fn get_backlink_count(conn: &Connection, note_id: &str) -> i64 {
     .unwrap_or(0)
 }
 
-/// The title of a (non-deleted) note, or `None` if absent.
-pub fn get_note_title(conn: &Connection, note_id: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT title FROM notes WHERE noteId = ?1 AND isDeleted = 0",
-        [note_id],
-        |row| row.get(0),
-    )
-    .ok()
-}
-
 /// The `#icon` label value of a note, if it has one.
 pub fn get_note_icon(conn: &Connection, note_id: &str) -> Option<String> {
     conn.query_row(

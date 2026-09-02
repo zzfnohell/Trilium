@@ -19,58 +19,44 @@
 验证基线：界面正常渲染笔记树与正文，`hasTree:true`、`hasCritical:false`、`failingLinks:[]`、
 启动日志无 `log-error` / `frontend-unhandledrejection` toast。
 
-### 🔄 进行中：受保护笔记加密/解密（本步骤，未提交）
+### ✅ 受保护笔记加密/解密（本步骤，已实现，未提交）
 
-目标：对齐 `packages/trilium-core` 的受保护笔记链路 —— scrypt 派生密钥、AES-128-CBC
-数据加密、会话登录/登出、受保护内容的读（解密/掩码）与写（加密）、protect 动作。
+对齐 `packages/trilium-core` 的受保护笔记链路：scrypt 派生密钥、AES-128-CBC 数据加密、
+会话登录/登出、受保护内容的读（解密/掩码）与写（加密）、protect 动作。`cargo check` 零警告、
+9 项单测全绿（含写路径集成测试）。
 
-#### 已完成（工作区未提交）
+#### 实现内容
 
-- `Cargo.toml`：新增 `scrypt` / `aes` / `block-modes` 依赖。
+- `Cargo.toml`：新增 `scrypt` / `aes` / `cbc` 依赖。
 
 - `src/crypto.rs`（新）：`data_encryption`/`scrypt`/`password_encryption` 纯函数镜像
   —— `pad16`、`scrypt_derive`(N=16384,r=8,p=1)、`encrypt_bytes`（4 字节 SHA1 摘要前缀 +
   随机 16 字节 IV + AES-128-CBC + PKCS7 → base64(iv‖ct)）、`decrypt`（16/13 字节 IV 兼容、
-  摘要校验、`#510` 非密文恢复）、`constant_time_eq`；含单测（往返/密钥截断/13 字节 IV/摘要
-  不匹配/非密文/前缀哈希互异）。
+  摘要校验、`#510` 非密文恢复）、`constant_time_eq`；单测覆盖往返/密钥截断/13 字节 IV/
+  摘要不匹配/错误密钥/非密文/前缀哈希互异。
 
 - `src/services/protected_session.rs`（新）：进程级会话状态（数据密钥 Mutex）+ 密码服务
-  —— `process_content`（锁定返回空串、解锁解密、旧数据原样恢复）、`title_or_mask`
-  （锁定 `[protected]`、解锁解密标题）、`verify_password`/`get_data_key`/`set_password`/
-  `change_password`/`reset_password`。
+  —— `process_content`、`title_or_mask`、`decrypt_bytes`、`verify_password`/`get_data_key`/
+  `set_password`/`change_password`/`reset_password`。
 
-- `src/db/mod.rs`：`set_option`（options 行 upsert，保留 `isSynced`）。
+- `src/db/write.rs`：`update_note_data` 支持受保护笔记（事务内加密内容 + `_ENCRYPTED_`
+  前缀 blobId 哈希；无会话时按"not available"400 拒绝）；`save_attachment` 保护感知（内容
+  加密 + title 加密存储）；`copy_attachment` 沿用源附件保护状态；`protect_note` 整树翻转
+  笔记/revisions/attachments 的 `isProtected`（内容、标题、textRepresentation 一并重加密，
+  逐实体写 EntityChange）。`random_string`/`blob_id_for` 导出。
 
-- `src/main.rs`：注册 `mod crypto; mod services;`。
+- `src/commands/api.rs`：`POST login/protected`、`logout/protected`、`login/protected/touch`
+  （含 WS `protectedSessionLogin`/`protectedSessionLogout`）、`password/change`、`password/reset`、
+  `PUT notes/{id}/protect/{0|1}`（薄 handler + WS `taskSucceeded` toast）；读路径保护感知：
+  `get_blob`（解密或空串）、`get_note`/`get_attachments`/`get_autocomplete`/`title_path` 标题
+  掩码/解密；`get_options` 过滤密码与 LLM 密钥、输出 `isPasswordSet` / `is*KeySet`。
 
-- `src/commands/api.rs`（部分）：
+- `src/db/tree.rs`：`build_response` 标题掩码/解密。
 
-  - `dispatch` 接入 `POST login/protected`、`login/protected/touch`、`logout/protected`（含
-    WS `protectedSessionLogin`/`protectedSessionLogout` 事件）、`password/change`、`password/reset`、
-    `PUT notes/{id}/protect/{flag}`（草稿，待重写）。
+#### 待验证（手动）
 
-  - 读路径保护感知：`get_blob`（解密或空串）、`get_note` / `get_attachments`（标题掩码/解密）。
-
-#### 待完成
-
-- [ ] `db/write.rs`：`update_note_data` 支持受保护笔记 —— 写事务内加密内容、blobId 用
-  `_ENCRYPTED_` 前缀哈希（`getUnencryptedContentForHashCalculation`）；`save_attachment`
-  / `copy_attachment` 保护感知（copy 沿用源附件 isProtected）；暴露 `random_string`。
-
-- [ ] `db/write.rs`：`protect_note(noteId, protect, subtree)` —— 翻转笔记/revisions/attachments
-  的 `isProtected`，内容重加密写新 blob、旧 blob 无引用则清除，`textRepresentation` 同步
-  重加密，逐条写 EntityChange。
-
-- [ ] `commands/api.rs`：把 protect 路由改为薄 handler（调用 `write::protect_note` + WS
-  `taskSucceeded` toast），删除草稿里的临时辅助函数。
-
-- [ ] `commands/api.rs`：`get_options` 过滤密码/密钥选项 + 输出 `isPasswordSet`（对齐
-  `options.ts` 的 readable 过滤）；`get_autocomplete` / `title_path` 标题掩码。
-
-- [ ] `db/tree.rs`：`build_response` 笔记标题掩码/解密。
-
-- [ ] 编译验证：`cargo check`；跑 `crypto.rs` 单测；用真实数据库（保护过笔记的 document.db）
-  端到端验证登录 → 读取解密 → 保存加密 → 登出后掩码。
+- 在有受保护笔记 + 已知密码的真实数据库中端到端验证：登录 → 树/标题解密 → 读取解密 →
+  编辑保存加密 → 登出后标题`[protected]`、内容空串；protect 按钮翻转子树。
 
 ### ⏳ 待办（后续步骤）
 
@@ -84,21 +70,23 @@
 
 - 其他零碎：`password` 选项读写口的对齐、notes 新建/改名/删除等写路由、保护会话超时自动锁定。
 
-## 当前工作区状态（本步骤进行中）
+## 当前工作区状态
 
 未提交改动（不 push，用户确认后才 commit）：
 
 ```
  M apps/tauri/src-tauri/Cargo.toml
  M apps/tauri/src-tauri/src/commands/api.rs
- M apps/tauri/src-tauri/src/db/mod.rs
+ M apps/tauri/src-tauri/src/db/mod.rs          # set_option + 删 get_note_title
+ M apps/tauri/src-tauri/src/db/tree.rs         # 标题掩码
+ M apps/tauri/src-tauri/src/db/write.rs        # 保护写路径 + protect_note
  M apps/tauri/src-tauri/src/main.rs
 ?? apps/tauri/src-tauri/src/crypto.rs
 ?? apps/tauri/src-tauri/src/services/         # mod.rs + protected_session.rs
+?? apps/tauri/src-tauri/MIGRATION_PLAN.md       # 本计划（含 .gitattributes 修复记录）
 ```
 
-注意：`api.rs` 中 protect 路由草稿块与 `get_blob_for_write`/`update_attachment`/`update_note_content_and_hash`
-引用 `write::` 尚未存在的辅助函数，属待重写内容，编译前必须清理。
+已提交：`471d7296d9`（.gitattributes 补丁 LF 修复）。
 
 ## 约定
 

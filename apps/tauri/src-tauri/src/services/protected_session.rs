@@ -171,8 +171,14 @@ pub fn set_password(conn: &Connection, new_password: &str) -> Result<(), String>
     write_password_options(conn, new_password, None)
 }
 
-/// `changePassword`: re-wrap the existing data key under the new password.
+/// `changePassword`: when no password is set yet this is the initial `setPassword`
+/// (the real route dispatches the same way); otherwise re-wrap the existing data
+/// key under the new password.
 pub fn change_password(conn: &Connection, current_password: &str, new_password: &str) -> Result<PasswordChange, String> {
+    if !is_password_set(conn) {
+        set_password(conn, new_password)?;
+        return Ok(PasswordChange::Ok);
+    }
     if !verify_password(conn, current_password) {
         return Ok(PasswordChange::WrongPassword);
     }

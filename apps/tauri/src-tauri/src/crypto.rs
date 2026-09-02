@@ -18,8 +18,9 @@
 use aes::Aes128;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use block_modes::block_padding::Pkcs7;
-use block_modes::{BlockMode, Cbc};
+use cbc::cipher::block_padding::Pkcs7;
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use cbc::{Decryptor, Encryptor};
 use rand::Rng;
 use sha1::{Digest as _, Sha1};
 
@@ -32,7 +33,8 @@ pub const ENCRYPTED_PREFIX: &str = "t$[nvQg7q)&_ENCRYPTED_?M:Bf&j3jr_";
 /// session is not active (`getTitleOrProtected`).
 pub const PROTECTED_MASK: &str = "[protected]";
 
-type Aes128Cbc = Cbc<Aes128, Pkcs7>;
+type Aes128CbcEnc = Encryptor<Aes128>;
+type Aes128CbcDec = Decryptor<Aes128>;
 
 /// The outcome of a decryption: verified plaintext, a digest mismatch (garbage
 /// key or corrupted payload), or bytes that are not AES-CBC ciphertext at all
@@ -69,9 +71,10 @@ pub fn rand_bytes(n: usize) -> Vec<u8> {
 /// The real server passes the option value (a base64 string) straight into
 /// `crypto.scrypt`, so it is used as UTF-8 bytes, not base64-decoded.
 pub fn scrypt_derive(password: &str, salt: &str) -> Result<Vec<u8>, String> {
-    let params = scrypt::Params::new(14, 8, 1, 32).map_err(|e| format!("invalid scrypt params: {e}"))?;
+    // N = 2^14 = 16384, matching the real `SCRYPT_OPTIONS`.
+    let params = scrypt::ScryptParams::new(14, 8, 1).map_err(|e| format!("invalid scrypt params: {e}"))?;
     let mut out = vec![0u8; 32];
-    scrypt::scrypt(password.as_bytes(), salt.as_bytes(), &mut out, &params)
+    scrypt::scrypt(password.as_bytes(), salt.as_bytes(), &params, &mut out)
         .map_err(|e| format!("scrypt failed: {e}"))?;
     Ok(out)
 }
@@ -101,9 +104,9 @@ pub fn encrypt_bytes(key: &[u8], plain: &[u8]) -> String {
     payload.extend_from_slice(&digest[..4]);
     payload.extend_from_slice(plain);
 
-    let cipher = Aes128Cbc::new_var(&key16, &iv).expect("16-byte key and IV");
+    let cipher = Aes128CbcEnc::new_from_slices(&key16, &iv).expect("16-byte key and IV");
     let mut out = iv;
-    out.extend_from_slice(&cipher.encrypt_vec(&payload));
+    out.extend_from_slice(&cipher.encrypt_padded_vec_mut::<Pkcs7>(&payload));
     BASE64.encode(out)
 }
 
@@ -125,13 +128,12 @@ pub fn decrypt(key: &[u8], cipher_text: &str) -> DecryptOutcome {
         return DecryptOutcome::NotCiphertext;
     }
     let (iv, ct) = bytes.split_at(iv_len);
-    let cipher = match Aes128Cbc::new_var(&pad16(key), &pad16(iv)) {
-        Ok(cipher) => cipher,
-        Err(_) => return DecryptOutcome::NotCiphertext,
+    let Ok(cipher) = Aes128CbcDec::new_from_slices(&pad16(key), &pad16(iv)) else {
+        return DecryptOutcome::NotCiphertext;
     };
     // A length/padding failure is the WRONG_FINAL_BLOCK_LENGTH case: the value
     // was never real ciphertext, and the real server hands it back as itself.
-    let Ok(decrypted) = cipher.decrypt_vec(ct) else {
+    let Ok(decrypted) = cipher.decrypt_padded_vec_mut::<Pkcs7>(ct) else {
         return DecryptOutcome::NotCiphertext;
     };
     if decrypted.len() < 4 {
@@ -168,11 +170,11 @@ mod tests {
     #[test]
     fn encrypt_then_decrypt_round_trips() {
         let key = b"0123456789abcdef";
-        for plain in [b"", b"a", b"hello world!", b"x".repeat(16), b"x".repeat(50)] {
+        for plain in [Vec::new(), b"a".to_vec(), b"hello world!".to_vec(), b"x".repeat(16), b"x".repeat(50)] {
             let cipher = encrypt_bytes(key, &plain);
             assert_eq!(
                 decrypt(key, &cipher),
-                DecryptOutcome::Ok(plain.to_vec()),
+                DecryptOutcome::Ok(plain.clone()),
                 "round trip for {} bytes",
                 plain.len()
             );
@@ -202,18 +204,42 @@ mod tests {
             v.extend_from_slice(b"legacy");
             v
         };
-        let cipher = Aes128Cbc::new_var(&pad16(key), &pad16(iv)).unwrap();
+        let cipher = Aes128CbcEnc::new_from_slices(&pad16(key), &pad16(iv)).unwrap();
         let mut raw = iv.to_vec();
-        raw.extend_from_slice(&cipher.encrypt_vec(&payload));
+        raw.extend_from_slice(&cipher.encrypt_padded_vec_mut::<Pkcs7>(&payload));
         let encoded = BASE64.encode(raw);
         assert_eq!(decrypt(key, &encoded), DecryptOutcome::Ok(b"legacy".to_vec()));
     }
 
     #[test]
     fn digest_mismatch_is_reported() {
+        // A payload whose padding is valid but whose 4-byte SHA-1 digest is wrong
+        // fails exactly on the digest check (wrong keys usually fail earlier, on
+        // AES-CBC unpadding, so this is the deterministic path to BadDigest).
+        let key = b"0123456789abcdef";
+        let plain = b"secret";
+        let mut digest = sha1(plain);
+        digest[0] ^= 0x01;
+        let mut payload = digest[..4].to_vec();
+        payload.extend_from_slice(plain);
+        let nonce = rand_bytes(16);
+        let cipher = Aes128CbcEnc::new_from_slices(&pad16(key), &nonce).unwrap();
+        let mut raw = nonce;
+        raw.extend_from_slice(&cipher.encrypt_padded_vec_mut::<Pkcs7>(&payload));
+        assert_eq!(decrypt(key, &BASE64.encode(raw)), DecryptOutcome::BadDigest);
+    }
+
+    #[test]
+    fn wrong_key_never_yields_plaintext() {
         let key = b"0123456789abcdef";
         let cipher = encrypt_bytes(key, b"secret");
-        assert_eq!(decrypt(b"fedcba9876543210", &cipher), DecryptOutcome::BadDigest);
+        match decrypt(b"fedcba9876543210", &cipher) {
+            DecryptOutcome::Ok(bytes) => panic!(
+                "wrong key must not decrypt, got {:?}",
+                String::from_utf8_lossy(&bytes)
+            ),
+            _ => {}
+        }
     }
 
     #[test]
