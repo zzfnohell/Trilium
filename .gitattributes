@@ -19,6 +19,10 @@ demo/**/*.txt eol=lf
 demo/**/*.js eol=lf
 demo/**/*.css eol=lf
 *.sh eol=lf
+# pnpm's patch parser (jsdiff) reads header file names from the patch bytes; a
+# CRLF checkout under autocrlf would embed a trailing \r into the name and fail
+# with "invalid char in unquoted filename", so patches are always LF on disk.
+patches/*.patch text eol=lf
 
 # Always diff TypeScript sources as text so a stray control byte (e.g. a NUL in
 # a string literal) doesn't make Git/GitHub treat the whole file as binary.
