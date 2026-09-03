@@ -17,6 +17,7 @@
 mod commands;
 mod crypto;
 mod db;
+mod icon_packs;
 mod messages;
 mod services;
 
@@ -244,6 +245,15 @@ const ELECTRON_BRIDGE_JS: &str = r#"
                 hasTree: !!document.querySelector('.tree, #left-pane, .note-tree'),
                 textLen: document.body.innerText.length,
                 hasCritical: !!document.querySelector('.toast-critical, .toast-persistent'),
+                iconPackCssLen: (function () {
+                    var styles = Array.prototype.slice.call(document.head.querySelectorAll('style'));
+                    for (var i = 0; i < styles.length; i++) {
+                        var t = styles[i].textContent || '';
+                        if (t.indexOf("font-family: 'boxicons'") >= 0) return t.length;
+                    }
+                    return 0;
+                })(),
+                iconFontLoaded: !!(document.fonts && document.fonts.status === 'loaded' && document.fonts.check('20px boxicons')),
                 sample: document.body.innerText.slice(0, 150)
             }));
         } catch (e) {}

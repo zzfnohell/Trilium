@@ -19,7 +19,7 @@
 验证基线：界面正常渲染笔记树与正文，`hasTree:true`、`hasCritical:false`、`failingLinks:[]`、
 启动日志无 `log-error` / `frontend-unhandledrejection` toast。
 
-### ✅ 受保护笔记加密/解密（本步骤，已实现，未提交）
+### ✅ 受保护笔记加密/解密（已提交 `93884c5e9e`，前置 `c5917b1cc8`）
 
 对齐 `packages/trilium-core` 的受保护笔记链路：scrypt 派生密钥、AES-128-CBC 数据加密、
 会话登录/登出、受保护内容的读（解密/掩码）与写（加密）、protect 动作。`cargo check` 零警告、
@@ -58,7 +58,7 @@
 - 在有受保护笔记 + 已知密码的真实数据库中端到端验证：登录 → 树/标题解密 → 读取解密 →
   编辑保存加密 → 登出后标题`[protected]`、内容空串；protect 按钮翻转子树。
 
-### ✅ 附件 CRUD（本步骤，已实现，未提交）
+### ✅ 附件 CRUD（已提交 `93884c5e9e` / `1f6c330c24` 线，含后续 `cba58ecaac`、`b88c672df8`）
 
 对齐 `attachments.ts` 的 JSON 附件路由，`cargo check` 零警告、10 项测试全绿：
 
@@ -78,7 +78,7 @@
 未纳入本步：multipart 上传（`server.upload` 走原生 `$.ajax`，shell 无 HTTP 层）、`convert-to-note`
 （依赖 notes 新建基建）、附件 `<img>` 资源服务 —— 见待办。
 
-### ✅ Multipart 上传 + convert-to-note（本步骤，已实现，未提交）
+### ✅ Multipart 上传 + convert-to-note（已提交 `1f6c330c24`）
 
 对齐 `attachments.ts` / `files.ts` / `image.ts` 的 multipart 路由与 `BAttachment.convertToNote`，
 `cargo check` 零警告、13 项测试全绿（对其 `TRILIUM_VERIFY_SOURCE` 真实库跑通 4 项集成测试）：
@@ -115,6 +115,25 @@
 未纳入本步：附件 `<img>` 资源服务（`api/attachments/{id}/image/{name}` 拦截，convert 后的图片
 当前在 shell 中不渲染）、`saveRevision` 附件版本管理 —— 见待办。
 
+### ✅ 图标修复（本步骤，未提交）
+
+bootstrap 负载中 `iconPackCss`/`iconRegistry` 原为空串/空对象，`loadIcons()` 注入的是空 `<style>`，
+所有 `bx bx-*` 图标类没有 `@font-face`/`content` 规则 → 树/按钮/内容图标全部空白。已在 Rust 侧
+补齐，对齐 `getIconConfig` 的内置 Boxicons 半部：
+
+- `src/icon_packs.rs`（新）：`include_str!` 内嵌 trilium-core 的 `icon_pack_boxicons-v2.json`
+  （1635 图标），`builtin_icon_pack_css(assetPath)` 按 `generateCss` 生成 `@font-face`
+  （`src: url('…/fonts/boxicons.woff2')`）+ `.bx` 基类 + 每个图标的 `::before` content 规则；
+  `icon_registry()` 按 `generateIconRegistry` 输出 `{ sources: [{prefix:"bx", name, icon, icons}] }`。
+
+- `commands/bootstrap.rs`：`iconPackCss: builtin_icon_pack_css("")`、`iconRegistry: icon_registry()`。
+
+- `main.rs`：state dump 增加 `iconPackCssLen`（含 boxicons 的 `<style>` 字数）与 `iconFontLoaded`
+  （`document.fonts.check('20px boxicons')`）两个诊断字段。
+
+验证：`cargo test` 3 项单测全绿（CSS 含 @font-face/全部 icon 规则、assetPath 拼接、registry 全量）；
+实机启动 state dump `iconPackCssLen:72128`、`iconFontLoaded:true`、`failingLinks:[]`、`hasCritical:false`。
+
 ### ⏳ 待办（后续步骤）
 
 - notes 写路由基建：`createNewNote`（已有内部基建，公开路由未接）、改名、删除/撤销删除。
@@ -124,6 +143,11 @@
 
 - `saveRevision` 附件版本管理：revision 快照连同附件一起版本化。
 
+- 自定义图标包（`#iconPack` 笔记）与 task-state 图标 CSS：当前只有内置 Boxicons 包；
+  `icon_packs.rs` 尚未读自定义包的 JSON manifest/字体附件，`generateTaskStateCss`（`_taskStates`
+  子树 → `--task-state-glyph` 规则）也未生成。自定义包字体 URL
+  `api/attachments/download/{attachmentId}` 对应路由亦未实现。
+
 - 其他零碎：保护会话超时自动锁定、deleted-notes 读路由。
 
 ## 当前工作区状态
@@ -131,13 +155,14 @@
 未提交改动（不 push，用户确认后才 commit）：
 
 ```
- M apps/tauri/src-tauri/src/commands/api.rs   # 附件路由 + image-info + 公共序列化 + 测试
- M apps/tauri/src-tauri/src/db/mod.rs         # get_attachment / blob / content
- M apps/tauri/src-tauri/src/db/write.rs       # save/rename/delete_attachment
+ M apps/tauri/src-tauri/src/main.rs                 # state dump 加 iconPackCssLen/iconFontLoaded 诊断
+ M apps/tauri/src-tauri/src/commands/bootstrap.rs   # iconPackCss/iconRegistry 真实输出
+ M apps/tauri/src-tauri/src/icon_packs.rs           # 新：内置 Boxicons 包 CSS + registry + 单测
  M apps/tauri/MIGRATION_PLAN.md
 ```
 
-已提交：`93884c5e9e`（受保护笔记）、`471d7296d9`（.gitattributes LF 修复）。
+已提交：`93884c5e9e`（受保护笔记）、`1f6c330c24`（multipart+convert）、`cba58ecaac`、`b88c672df8`、
+`471d7296d9`（.gitattributes LF 修复）等。
 
 ## 约定
 
