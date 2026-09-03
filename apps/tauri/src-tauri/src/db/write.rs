@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use chrono::{Duration, Local, Utc};
+use chrono::{Datelike, Duration, Local, NaiveDate, Utc};
 use rand::Rng;
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -2766,6 +2766,547 @@ fn created_note_blob(conn: &Connection, note_id: &str) -> rusqlite::Result<Optio
     conn.query_row("SELECT blobId FROM notes WHERE noteId = ?1", params![note_id], |row| row.get(0)).optional()
 }
 
+// ---------------------------------------------------------------------------
+// Calendar journal notes — the `special-notes/days` get-or-create chain from
+// `date_notes.ts` (year → quarter → month → week → day), plus `#inbox`.
+// ---------------------------------------------------------------------------
+
+/// Constants from `date_notes.ts`: the label that pins a note to a calendar period.
+const YEAR_LABEL: &str = "yearNote";
+const QUARTER_LABEL: &str = "quarterNote";
+const MONTH_LABEL: &str = "monthNote";
+const WEEK_LABEL: &str = "weekNote";
+const DATE_LABEL: &str = "dateNote";
+
+/// English month/weekday names stand in for the `t()` catalogs in the default
+/// title patterns — the shell serves the en catalogue only, and the calendar
+/// itself is driven by the `#dateNote`-style labels, not the titles.
+const EN_MONTHS: [&str; 12] = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+];
+
+/// `date.day()` is 0-based Sunday, matching dayjs.
+const EN_WEEKDAYS: [&str; 7] =
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+/// `GET /special-notes/{kind}/{key}` in one transaction, mirroring the
+/// `asyncApiRoute` wrapper: resolve (or create) the calendar root, then walk the
+/// period chain, creating whatever is missing. Returns the requested note id.
+pub fn get_special_period_note(
+    conn: &Connection,
+    kind: &str,
+    key: &str,
+    calendar_root_id: Option<&str>,
+) -> Result<String, WriteError> {
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> Result<String, WriteError> {
+        if kind == "inbox" {
+            return get_inbox_note(conn, calendar_root_id, key).map_err(WriteError::from);
+        }
+        if !matches!(kind, "year" | "quarter" | "month" | "week" | "day") {
+            return Err(WriteError {
+                status: 400,
+                message: format!("Invalid special-note kind '{kind}'"),
+            });
+        }
+        let root = calendar_root_note(conn, calendar_root_id)?;
+        match kind {
+            "year" => get_year_note(conn, &root, key),
+            "quarter" => get_quarter_note(conn, &root, key),
+            "month" => get_month_note(conn, &root, key),
+            "week" => get_week_note(conn, &root, key),
+            _ => get_day_note(conn, &root, key),
+        }
+    })();
+    match run {
+        Ok(note_id) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(note_id)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
+/// `getInboxNote` with the shell hoisted at root: the `#inbox` note if the
+/// knowledge base has one, otherwise today's day note (`getDayNote`) — the root-
+/// workspace branch of `special_notes.ts`. The `date` argument is the fallback's
+/// day (mirroring the `/special-notes/inbox/:date` path param).
+fn get_inbox_note(conn: &Connection, calendar_root_id: Option<&str>, date: &str) -> Result<String, WriteError> {
+    if let Some(note_id) = find_labeled_note(conn, "inbox", None, None)? {
+        return Ok(note_id);
+    }
+    let root = calendar_root_note(conn, calendar_root_id)?;
+    get_day_note(conn, &root, date)
+}
+
+/// `getRootCalendarNote`: the note the `calendarRootId` query names, else the
+/// `#calendarRoot`-labeled note, else a fresh "Calendar" note under `root`.
+/// Runs inside the caller's transaction, like every other helper here.
+fn calendar_root_note(conn: &Connection, calendar_root_id: Option<&str>) -> Result<String, WriteError> {
+    if let Some(note_id) = calendar_root_id {
+        if load_note(conn, note_id)?.is_none() {
+            return Err(WriteError {
+                status: 400,
+                message: format!("Note '{note_id}' was not found."),
+            });
+        }
+        return Ok(note_id.to_string());
+    }
+    if let Some(note_id) = find_labeled_note(conn, "calendarRoot", None, None)? {
+        return Ok(note_id);
+    }
+    let created = create_new_note(conn, "root", "Calendar", "text", "text/html", false, &[])?;
+    insert_attribute(conn, &created.note_id, "label", "calendarRoot", "")?;
+    insert_attribute(conn, &created.note_id, "label", "sorted", "")?;
+    Ok(created.note_id)
+}
+
+/// The first non-deleted note carrying a `label` (optionally with a specific
+/// `value`) that has `ancestor` among its parents — `findFirstNoteWithQuery` +
+/// `BNote.hasAncestor` for the `#unitNote="key"` searches.
+fn find_labeled_note(
+    conn: &Connection,
+    label: &str,
+    value: Option<&str>,
+    ancestor: Option<&str>,
+) -> rusqlite::Result<Option<String>> {
+    let found: Option<String> = conn
+        .query_row(
+            "SELECT a.noteId FROM attributes a \
+             JOIN notes n ON n.noteId = a.noteId \
+             WHERE a.isDeleted = 0 AND n.isDeleted = 0 AND a.type = 'label' AND a.name = ?1 \
+               AND (?2 IS NULL OR a.value = ?2) \
+               AND (?3 IS NULL OR EXISTS ( \
+                    WITH RECURSIVE anc(noteId) AS ( \
+                        SELECT a.noteId \
+                        UNION \
+                        SELECT b.parentNoteId FROM branches b \
+                        JOIN anc ON b.noteId = anc.noteId AND b.isDeleted = 0 \
+                    ) SELECT 1 FROM anc WHERE noteId = ?3 LIMIT 1 \
+               )) \
+             LIMIT 1",
+            params![label, value, ancestor],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found)
+}
+
+/// Whether the note owns a `label` (`#enableWeekNote` on the calendar root gates
+/// the week level, `#enableQuarterNote` the quarter level).
+fn root_has_label(conn: &Connection, root_id: &str, name: &str) -> rusqlite::Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM attributes WHERE noteId = ?1 AND type = 'label' AND name = ?2 AND isDeleted = 0 LIMIT 1",
+            params![root_id, name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// The target of a note's owned `~{name}` relation (the calendar root's
+/// `~yearTemplate`/`~monthTemplate`/... that seeds a `~template` per period note).
+fn owned_relation_target(conn: &Connection, note_id: &str, name: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM attributes WHERE noteId = ?1 AND type = 'relation' AND name = ?2 AND isDeleted = 0 LIMIT 1",
+        params![note_id, name],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// `getYearNote` — the `#yearNote` note under the calendar root, created when
+/// absent (its title is the plain year string, not a pattern).
+fn get_year_note(conn: &Connection, root_id: &str, date_str: &str) -> Result<String, WriteError> {
+    let year = first_chars(date_str, 4);
+    if let Some(existing) = find_labeled_note(conn, YEAR_LABEL, Some(&year), Some(root_id))? {
+        return Ok(existing);
+    }
+    create_calendar_note(conn, root_id, &year, YEAR_LABEL, &year, root_id, "year").map_err(WriteError::from)
+}
+
+/// `getQuarterNote` — the `#quarterNote` note ("2026-Q2") under the year note,
+/// created when absent.
+fn get_quarter_note(conn: &Connection, root_id: &str, quarter_str: &str) -> Result<String, WriteError> {
+    let quarter = first_chars(quarter_str, 7);
+    if let Some(existing) = find_labeled_note(conn, QUARTER_LABEL, Some(&quarter), Some(root_id))? {
+        return Ok(existing);
+    }
+    let Some(quarter_number) = quarter_number_of(&quarter) else {
+        return Err(WriteError { status: 400, message: format!("Invalid quarter string '{quarter}'") });
+    };
+    let start = quarter_start_date(quarter_number);
+    let title = journal_title(conn, root_id, "quarter", start, quarter_number, None);
+    let year_note = get_year_note(conn, root_id, &quarter[..4])?;
+    create_calendar_note(conn, &year_note, &title, QUARTER_LABEL, &quarter, root_id, "quarter").map_err(WriteError::from)
+}
+
+/// `getMonthNote` — the `#monthNote` note ("2026-08") under the year note (or the
+/// quarter note when the calendar root enables quarter notes), created when absent.
+fn get_month_note(conn: &Connection, root_id: &str, month_str: &str) -> Result<String, WriteError> {
+    let month = first_chars(month_str, 7);
+    if let Some(existing) = find_labeled_note(conn, MONTH_LABEL, Some(&month), Some(root_id))? {
+        return Ok(existing);
+    }
+    let Some((year, month_number)) = year_month_of(&month) else {
+        return Err(WriteError { status: 400, message: format!("Invalid month string '{month}'") });
+    };
+    let title = journal_title(conn, root_id, "month", NaiveDate::from_ymd_opt(year, month_number, 1).unwrap(), i64::from(month_number), None);
+    let parent = if root_has_label(conn, root_id, "enableQuarterNote")? {
+        let quarter_number = i64::from((month_number - 1) / 3 + 1);
+        get_quarter_note(conn, root_id, &format!("{year}-Q{quarter_number}"))?
+    } else {
+        get_year_note(conn, root_id, &year.to_string())?
+    };
+    create_calendar_note(conn, &parent, &title, MONTH_LABEL, &month, root_id, "month").map_err(WriteError::from)
+}
+
+/// `getWeekNote` — the `#weekNote` note ("2026-W33") under the week's month note,
+/// created when absent; a week spanning two months is cloned into the other month,
+/// like `cloningService.cloneNoteToParentNote` in the real chain.
+fn get_week_note(conn: &Connection, root_id: &str, week_str: &str) -> Result<String, WriteError> {
+    let week = first_chars(week_str, 8);
+    if let Some(existing) = find_labeled_note(conn, WEEK_LABEL, Some(&week), Some(root_id))? {
+        return Ok(existing);
+    }
+    let Some((week_year, week_number)) = week_info_of(&week) else {
+        return Err(WriteError { status: 400, message: format!("Invalid week string '{week}'") });
+    };
+    let start = first_day_of_week1(conn, week_year) + Duration::days((week_number - 1) * 7);
+    let end = start + Duration::days(6);
+    let title = journal_title(conn, root_id, "week", start, week_number, Some(i64::from(week_year)));
+    let start_month = get_month_note(conn, root_id, &start.format("%Y-%m").to_string())?;
+    let created = create_calendar_note(conn, &start_month, &title, WEEK_LABEL, &week, root_id, "week")?;
+    if start.month() != end.month() {
+        let end_month = get_month_note(conn, root_id, &end.format("%Y-%m").to_string())?;
+        clone_note_to_parent(conn, &created, &end_month)?;
+    }
+    Ok(created)
+}
+
+/// `getDayNote` — the `#dateNote` note ("2026-08-31") under the week note (when the
+/// calendar root enables week notes) or the month note, created when absent. The
+/// whole year → quarter → month → week ladder can materialize in one call.
+fn get_day_note(conn: &Connection, root_id: &str, date_str: &str) -> Result<String, WriteError> {
+    let date_attr = first_chars(date_str, 10);
+    if let Some(existing) = find_labeled_note(conn, DATE_LABEL, Some(&date_attr), Some(root_id))? {
+        return Ok(existing);
+    }
+    let Some(date) = NaiveDate::parse_from_str(&date_attr, "%Y-%m-%d").ok() else {
+        return Err(WriteError { status: 400, message: format!("Invalid date '{date_attr}'") });
+    };
+    let title = journal_title(conn, root_id, "day", date, i64::from(date.day()), None);
+    let parent = if root_has_label(conn, root_id, "enableWeekNote")? {
+        let week = week_string_for(conn, date);
+        get_week_note(conn, root_id, &week)?
+    } else {
+        get_month_note(conn, root_id, &date.format("%Y-%m").to_string())?
+    };
+    create_calendar_note(conn, &parent, &title, DATE_LABEL, &date_attr, root_id, "day").map_err(WriteError::from)
+}
+
+/// `getWeekFirstDayNote`'s week start for a date, honoring the stored week options
+/// (defaults: Monday, first-week-contains-Jan-1st). Returns the trimmed date when
+/// it does not parse, so the fallback day note still gets a recognizable label.
+pub fn get_week_start_date_for(conn: &Connection, encoded_date: &str) -> String {
+    let date = first_chars(encoded_date, 10);
+    let Some(parsed) = NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok() else {
+        return date;
+    };
+    let (first_day_of_week, _, _) = week_settings(conn);
+    let days = (iso_weekday(parsed) - first_day_of_week).rem_euclid(7);
+    (parsed - Duration::days(days)).format("%Y-%m-%d").to_string()
+}
+
+/// `date_notes.ts` `getWeekString` for a date, per the stored week options.
+fn week_string_for(conn: &Connection, date: NaiveDate) -> String {
+    let (week_year, week_number) = week_info(conn, date);
+    format!("{week_year}-W{week_number:02}")
+}
+
+/// The stored week options (`firstDayOfWeek`, `firstWeekOfYear`,
+/// `minDaysInFirstWeek`) with `date_notes.ts`' defaults.
+fn week_settings(conn: &Connection) -> (i64, i64, i64) {
+    let parse = |name: &str, default| crate::db::get_option(conn, name).and_then(|v| v.parse().ok()).unwrap_or(default);
+    (parse("firstDayOfWeek", 1), parse("firstWeekOfYear", 0), parse("minDaysInFirstWeek", 4))
+}
+
+/// The Monday=1..Sunday=7 numbering dayjs uses.
+fn iso_weekday(date: NaiveDate) -> i64 {
+    i64::from(date.weekday().num_days_from_monday()) + 1
+}
+
+/// `getFirstDayOfWeek1`: the first day of week 1 of the year (first week of the
+/// year contains Jan 1 by default; ISO's first-Thursday or a minimum-days rule
+/// when the stored `firstWeekOfYear` selects it).
+fn first_day_of_week1(conn: &Connection, year: i32) -> NaiveDate {
+    let (first_day_of_week, first_week_of_year, min_days_in_first_week) = week_settings(conn);
+    let jan1 = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+    let days_to_subtract = (iso_weekday(jan1) - first_day_of_week).rem_euclid(7);
+    let week_containing_jan1 = jan1 - Duration::days(days_to_subtract);
+
+    if first_week_of_year == 1 {
+        let jan4 = NaiveDate::from_ymd_opt(year, 1, 4).unwrap();
+        let days = (iso_weekday(jan4) - first_day_of_week).rem_euclid(7);
+        return jan4 - Duration::days(days);
+    }
+    if first_week_of_year >= 2 {
+        let days_in_first_week = 7 - days_to_subtract;
+        if days_in_first_week < min_days_in_first_week {
+            return week_containing_jan1 + Duration::days(7);
+        }
+    }
+    week_containing_jan1
+}
+
+/// `getWeekInfo`: the week year + number of a date, per the stored week options.
+fn week_info(conn: &Connection, date: NaiveDate) -> (i64, i64) {
+    let (first_day_of_week, _, _) = week_settings(conn);
+    let days = (iso_weekday(date) - first_day_of_week).rem_euclid(7);
+    let week_start = date - Duration::days(days);
+
+    let mut week_year = date.year();
+    let mut first = first_day_of_week1(conn, week_year);
+    if week_start < first {
+        week_year -= 1;
+        first = first_day_of_week1(conn, week_year);
+    } else {
+        let next = first_day_of_week1(conn, week_year + 1);
+        if week_start >= next {
+            week_year += 1;
+            first = next;
+        }
+    }
+    let week_number = (week_start - first).num_days() / 7 + 1;
+    (i64::from(week_year), week_number)
+}
+
+/// The quarter number of a "2026-Q2" string, or `None` when malformed.
+fn quarter_number_of(quarter: &str) -> Option<i64> {
+    let (_, number) = quarter.split_once("-Q")?;
+    let number: i64 = number.trim().parse().ok()?;
+    (1..=4).contains(&number).then_some(number)
+}
+
+/// The first day of a quarter (quarter 1 → Jan 1, 2 → Apr 1, ...). The year is a
+/// fixed placeholder: `{year}` is not an allowed replacement for the quarter
+/// title pattern, so no title reads it.
+fn quarter_start_date(quarter_number: i64) -> NaiveDate {
+    NaiveDate::from_ymd_opt(2000, ((quarter_number - 1) * 3 + 1) as u32, 1).unwrap()
+}
+
+/// `(year, month)` of a "2026-08" string, or `None` when malformed.
+fn year_month_of(month: &str) -> Option<(i32, u32)> {
+    let (year, number) = month.split_once('-')?;
+    let year: i32 = year.trim().parse().ok()?;
+    let number: u32 = number.trim().parse().ok()?;
+    if !(1..=12).contains(&number) {
+        return None;
+    }
+    Some((year, number))
+}
+
+/// `(week year, week number)` of a "2026-W33" string, or `None` when malformed.
+fn week_info_of(week: &str) -> Option<(i32, i64)> {
+    let (year, number) = week.split_once("-W")?;
+    let year: i32 = year.trim().parse().ok()?;
+    let number: i64 = number.trim().parse().ok()?;
+    if !(1..=53).contains(&number) {
+        return None;
+    }
+    Some((year, number))
+}
+
+/// Create a calendar period note under `parent_id`: a text note titled `title`,
+/// the period `label` set to `label_value`, the `#sorted` sort marker, and a
+/// `~template` relation when the calendar root carries a `{unit}Template`
+/// relation. Protected parents only beget protected period notes during an open
+/// protected session, mirroring `createNote` in `date_notes.ts`.
+fn create_calendar_note(
+    conn: &Connection,
+    parent_id: &str,
+    title: &str,
+    label: &str,
+    label_value: &str,
+    root_id: &str,
+    unit: &str,
+) -> rusqlite::Result<String> {
+    let parent = load_note(conn, parent_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let is_protected = parent.is_protected && session::is_available();
+    let created = create_new_note(conn, parent_id, title, "text", "text/html", is_protected, &[])?;
+    insert_attribute(conn, &created.note_id, "label", label, label_value)?;
+    insert_attribute(conn, &created.note_id, "label", "sorted", "")?;
+    if let Some(template_id) = owned_relation_target(conn, root_id, &format!("{unit}Template"))? {
+        insert_attribute(conn, &created.note_id, "relation", "template", &template_id)?;
+    }
+    Ok(created.note_id)
+}
+
+/// `cloningService.cloneNoteToParentNote`: add a branch under the parent when the
+/// note is not already there (branch id = "{parent}_{note}").
+fn clone_note_to_parent(conn: &Connection, note_id: &str, parent_id: &str) -> rusqlite::Result<()> {
+    let branch_id = format!("{parent_id}_{note_id}");
+    let already: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM branches WHERE branchId = ?1 AND isDeleted = 0",
+            params![branch_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already.is_some() {
+        return Ok(());
+    }
+    let utc = utc_now();
+    let position = note_position_for(conn, parent_id)?;
+    conn.execute(
+        "INSERT INTO branches (branchId, noteId, parentNoteId, notePosition, prefix, isExpanded, isDeleted, deleteId, utcDateModified) \
+         VALUES (?1, ?2, ?3, ?4, '', 0, 0, NULL, ?5)",
+        params![branch_id, note_id, parent_id, position, utc],
+    )?;
+    let input = format!("|{branch_id}|{note_id}|{parent_id}|");
+    put_entity_change(conn, "branches", &branch_id, &hash10(&input), &utc)
+}
+
+/// `getJournalNoteTitle`: fill the `{unit}Pattern`-derived title of a period note;
+/// only the placeholders the unit allows are replaced (the others stay literal, as
+/// in the real function).
+fn journal_title(
+    conn: &Connection,
+    root_id: &str,
+    unit: &str,
+    date: NaiveDate,
+    number: i64,
+    week_year: Option<i64>,
+) -> String {
+    let pattern = crate::db::get_label_value(conn, root_id, &format!("{unit}Pattern"))
+        .unwrap_or_else(|| default_pattern(unit).to_string());
+    let mut title = pattern;
+    for key in allowed_replacements(unit) {
+        if title.contains(key) {
+            title = title.replace(key, &replacement_value(date, number, week_year, key));
+        }
+    }
+    title
+}
+
+/// The default title pattern per period, from `date_notes.ts` (the `t()` results
+/// rendered with the en catalogue).
+fn default_pattern(unit: &str) -> &'static str {
+    match unit {
+        "quarter" => "Quarter {quarterNumber}",
+        "month" => "{monthNumberPadded} - {month}",
+        "week" => "Week {weekNumber}",
+        "day" => "{dateNumberPadded} - {weekDay}",
+        _ => "{year}",
+    }
+}
+
+/// The `{placeholder}` keys a period's title pattern may reference.
+fn allowed_replacements(unit: &str) -> &'static [&'static str] {
+    match unit {
+        "year" => &["{year}"],
+        "quarter" => &["{quarterNumber}", "{shortQuarter}"],
+        "month" => &["{isoMonth}", "{monthNumber}", "{monthNumberPadded}", "{month}", "{shortMonth3}", "{shortMonth4}"],
+        "week" => &["{weekNumber}", "{weekNumberPadded}", "{shortWeek}", "{shortWeek3}"],
+        _ => &["{isoDate}", "{dateNumber}", "{dateNumberPadded}", "{ordinal}", "{weekDay}", "{weekDay3}", "{weekDay2}"],
+    }
+}
+
+/// The value for one `{placeholder}` of a period title. For the week unit `number`
+/// is the caller's week number (cross-year weeks make it different from the
+/// date-derived one); `weekYear` overrides the display year for the same reason.
+fn replacement_value(date: NaiveDate, number: i64, week_year: Option<i64>, key: &str) -> String {
+    let year = week_year.unwrap_or_else(|| i64::from(date.year()));
+    let quarter = i64::from(date.month0() / 3 + 1);
+    let month = i64::from(date.month());
+    let day = i64::from(date.day());
+    match key {
+        "{year}" => year.to_string(),
+        "{isoMonth}" => date.format("%Y-%m").to_string(),
+        "{monthNumber}" => month.to_string(),
+        "{monthNumberPadded}" => format!("{month:02}"),
+        "{month}" => EN_MONTHS[(month - 1) as usize].to_string(),
+        "{shortMonth3}" => month_name(month, 3),
+        "{shortMonth4}" => month_name(month, 4),
+        "{quarterNumber}" => quarter.to_string(),
+        "{shortQuarter}" => format!("Q{quarter}"),
+        "{weekNumber}" => number.to_string(),
+        "{weekNumberPadded}" => format!("{number:02}"),
+        "{shortWeek}" => format!("W{number}"),
+        "{shortWeek3}" => format!("W{number:02}"),
+        "{isoDate}" => date.format("%Y-%m-%d").to_string(),
+        "{dateNumber}" => day.to_string(),
+        "{dateNumberPadded}" => format!("{day:02}"),
+        "{ordinal}" => format!("{day}{}", ordinal_suffix(day)),
+        "{weekDay}" => EN_WEEKDAYS[date.weekday().num_days_from_sunday() as usize].to_string(),
+        "{weekDay3}" => EN_WEEKDAYS[date.weekday().num_days_from_sunday() as usize][..3].to_string(),
+        "{weekDay2}" => EN_WEEKDAYS[date.weekday().num_days_from_sunday() as usize][..2].to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The first `len` characters of the English month name ("Jan", "Janu").
+fn month_name(month: i64, len: usize) -> String {
+    EN_MONTHS[(month - 1) as usize][..len].to_string()
+}
+
+/// The English ordinal suffix (`ordinal(date)` → `dayjs(...).format("Do")`).
+fn ordinal_suffix(day: i64) -> &'static str {
+    match day % 100 {
+        11 | 12 | 13 => "th",
+        _ => match day % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        },
+    }
+}
+
+/// The first `n` characters of a trimmed string (calendar keys are normalized to
+/// their fixed width exactly like `date_notes.ts`'s `substring(0, n)`).
+fn first_chars(s: &str, n: usize) -> String {
+    s.trim().chars().take(n).collect()
+}
+
+/// `DELETE /notes/{noteId}/attributes/{attributeId}` — `attributesRoute
+/// .deleteNoteAttribute`: a no-op when the attribute does not exist, a 400 when it
+/// belongs to another note, otherwise a `markAsDeleted` soft-delete with its
+/// deleted entity change.
+pub fn delete_note_attribute(conn: &Connection, note_id: &str, attribute_id: &str) -> Result<(), WriteError> {
+    let Some((owner_id, attr_type, name, value)) = conn
+        .query_row(
+            "SELECT noteId, type, name, value FROM attributes WHERE attributeId = ?1",
+            params![attribute_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(WriteError::from)?
+    else {
+        return Ok(());
+    };
+
+    if owner_id != note_id {
+        return Err(WriteError {
+            status: 400,
+            message: format!("Attribute {attribute_id} is not owned by {note_id}"),
+        });
+    }
+    delete_attribute(conn, attribute_id, &owner_id, &attr_type, &name, &value).map_err(WriteError::from)
+}
+
 /// `PUT /notes/{id}/title` — `notesApiRoute.changeTitle`: snapshot the note when the
 /// title actually changes, then store the new title (encrypted at rest for protected
 /// notes) with a fresh entity change. Protected notes require the open session.
@@ -3874,5 +4415,175 @@ mod tests {
             "note-lifecycle verification passed (note {}, after-sibling {}, orphan {})",
             created.note_id, after.note_id, orphan.note_id
         );
+    }
+
+    /// The English placeholders of `date_notes.ts` `getJournalNoteTitle` agree with the
+    /// dayjs-derived values for 2026-08-31 (Monday): month/weekday names, padding,
+    /// ordinal suffix, and the caller-supplied week number.
+    #[test]
+    fn journal_title_placeholders_fill_english_values() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+        // Day placeholders.
+        assert_eq!(replacement_value(date, 31, None, "{isoDate}"), "2026-08-31");
+        assert_eq!(replacement_value(date, 31, None, "{dateNumber}"), "31");
+        assert_eq!(replacement_value(date, 31, None, "{dateNumberPadded}"), "31");
+        assert_eq!(replacement_value(date, 31, None, "{ordinal}"), "31st");
+        assert_eq!(replacement_value(date, 31, None, "{weekDay}"), "Monday");
+        assert_eq!(replacement_value(date, 31, None, "{weekDay3}"), "Mon");
+        assert_eq!(replacement_value(date, 31, None, "{weekDay2}"), "Mo");
+        // Month placeholders.
+        assert_eq!(replacement_value(date, 8, None, "{isoMonth}"), "2026-08");
+        assert_eq!(replacement_value(date, 8, None, "{monthNumber}"), "8");
+        assert_eq!(replacement_value(date, 8, None, "{monthNumberPadded}"), "08");
+        assert_eq!(replacement_value(date, 8, None, "{month}"), "August");
+        assert_eq!(replacement_value(date, 8, None, "{shortMonth3}"), "Aug");
+        assert_eq!(replacement_value(date, 8, None, "{shortMonth4}"), "Augu");
+        // Quarter and week placeholders; the week unit takes the caller's week number.
+        assert_eq!(replacement_value(date, 3, None, "{quarterNumber}"), "3");
+        assert_eq!(replacement_value(date, 3, None, "{shortQuarter}"), "Q3");
+        assert_eq!(replacement_value(date, 36, Some(2026), "{weekNumber}"), "36");
+        assert_eq!(replacement_value(date, 36, Some(2026), "{weekNumberPadded}"), "36");
+        assert_eq!(replacement_value(date, 36, Some(2026), "{shortWeek}"), "W36");
+        assert_eq!(replacement_value(date, 36, Some(2026), "{shortWeek3}"), "W36");
+        assert_eq!(replacement_value(date, 0, None, "{year}"), "2026");
+        // The default patterns reference only allowed keys per unit.
+        assert_eq!(default_pattern("year"), "{year}");
+        assert_eq!(default_pattern("quarter"), "Quarter {quarterNumber}");
+        assert_eq!(default_pattern("month"), "{monthNumberPadded} - {month}");
+        assert_eq!(default_pattern("week"), "Week {weekNumber}");
+        assert_eq!(default_pattern("day"), "{dateNumberPadded} - {weekDay}");
+        // Ordinal suffixes follow the English "Do" rule.
+        for (day, suffix) in [
+            (1, "st"), (2, "nd"), (3, "rd"), (4, "th"), (11, "th"), (12, "th"), (13, "th"),
+            (21, "st"), (22, "nd"), (23, "rd"), (30, "th"), (31, "st"),
+        ] {
+            assert_eq!(ordinal_suffix(day), suffix);
+        }
+    }
+
+    /// Integration verification of the `special-notes/days/{date}` route against a copy
+    /// of a real database — the whole year → month → day ladder is materialized and
+    /// labeled like `date_notes.ts` would. Enabled by `TRILIUM_VERIFY_SOURCE`.
+    #[test]
+    fn day_note_chain_creates_years_months_and_the_day() {
+        let Ok(src) = std::env::var("TRILIUM_VERIFY_SOURCE") else {
+            eprintln!("TRILIUM_VERIFY_SOURCE not set; integration verification skipped");
+            return;
+        };
+        let conn = copy_db(&src);
+
+        let day_note_id = get_special_period_note(&conn, "day", "2026-08-31", None).unwrap();
+
+        let day_label: String = conn
+            .query_row(
+                "SELECT value FROM attributes WHERE noteId = ?1 AND type = 'label' AND name = 'dateNote' AND isDeleted = 0",
+                params![day_note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(day_label, "2026-08-31");
+
+        // The month and year notes hang under the calendar root (reusing an existing
+        // `#yearNote`/`#monthNote` when one is already there); the day sits under the
+        // month note. A real knowledge base may hold several `#calendarRoot` notes, so
+        // the assertion is that a `#calendarRoot`-labeled note is an ancestor of the
+        // month note, not that a specific parent id matches.
+        let month_note_id: String = conn
+            .query_row(
+                "SELECT a.noteId FROM attributes a \
+                 WHERE a.type = 'label' AND a.name = 'monthNote' AND a.value = '2026-08' AND a.isDeleted = 0 \
+                 LIMIT 1",
+                params![],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let month_title: String = conn
+            .query_row("SELECT title FROM notes WHERE noteId = ?1", params![month_note_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(month_title, "08 - August");
+        let under_calendar_root: i64 = conn
+            .query_row(
+                "WITH RECURSIVE anc(noteId) AS ( \
+                    SELECT ?1 \
+                    UNION \
+                    SELECT b.parentNoteId FROM branches b JOIN anc ON b.noteId = anc.noteId AND b.isDeleted = 0 \
+                 ) \
+                 SELECT COUNT(*) FROM anc a JOIN attributes attr \
+                    ON attr.noteId = a.noteId AND attr.type = 'label' AND attr.name = 'calendarRoot' AND attr.isDeleted = 0 \
+                 LIMIT 1",
+                params![month_note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(under_calendar_root >= 1, "the month note chain reaches a #calendarRoot note");
+        let day_parent: String = conn
+            .query_row("SELECT parentNoteId FROM branches WHERE noteId = ?1 AND isDeleted = 0", params![day_note_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(day_parent, month_note_id, "the day note sits under its month note");
+
+        // The day note title follows the default date pattern: "31 - Monday".
+        let day_title: String = conn
+            .query_row("SELECT title FROM notes WHERE noteId = ?1", params![day_note_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(day_title, "31 - Monday");
+
+        // A second call reuses the chain (idempotent), like the real `getDayNote`.
+        let again = get_special_period_note(&conn, "day", "2026-08-31", None).unwrap();
+        assert_eq!(again, day_note_id);
+    }
+
+    /// Integration verification of `DELETE /notes/{id}/attributes/{attrId}` against a copy
+    /// of a real database: soft-delete with the deleted entity change, and a 400 for a
+    /// foreign attribute. Enabled by `TRILIUM_VERIFY_SOURCE`.
+    #[test]
+    fn delete_note_attribute_soft_deletes_and_checks_ownership() {
+        let Ok(src) = std::env::var("TRILIUM_VERIFY_SOURCE") else {
+            eprintln!("TRILIUM_VERIFY_SOURCE not set; integration verification skipped");
+            return;
+        };
+        let conn = copy_db(&src);
+
+        // A fixture pair of notes; the second one owns a `#fixtureDel` label used as the
+        // foreign-attribute in the ownership-mismatch check.
+        let note_a = random_string(12);
+        let note_b = random_string(12);
+        let local = local_now();
+        let utc = utc_now();
+        for note_id in [&note_a, &note_b] {
+            conn.execute(
+                "INSERT INTO notes (noteId, title, isProtected, type, mime, isDeleted, dateCreated, \
+                 dateModified, utcDateCreated, utcDateModified) \
+                 VALUES (?1, 'fixture', 0, 'text', 'text/html', 0, ?2, ?3, ?4, ?5)",
+                params![note_id, local, local, utc, utc],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO attributes (attributeId, noteId, type, name, value, position, utcDateModified, isDeleted) \
+             VALUES ('fix-attr-del', ?1, 'label', 'fixtureDel', 'hello', 1, ?2, 0)",
+            params![note_a, utc],
+        )
+        .unwrap();
+
+        // Deleting from the wrong owner is refused (the route's ValidationError).
+        let foreign = delete_note_attribute(&conn, &note_b, "fix-attr-del").unwrap_err();
+        assert_eq!(foreign.status, 400);
+        assert!(foreign.message.contains("not owned by"));
+
+        // Deleting from the owner soft-deletes and records the deleted entity change.
+        delete_note_attribute(&conn, &note_a, "fix-attr-del").unwrap();
+        let (is_deleted, change_deleted): (i64, bool) = conn
+            .query_row(
+                "SELECT a.isDeleted, EXISTS(SELECT 1 FROM entity_changes c WHERE c.entityId = 'fix-attr-del' AND c.isErased = 0) \
+                 FROM attributes a WHERE a.attributeId = 'fix-attr-del'",
+                params![],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .unwrap();
+        assert_eq!(is_deleted, 1);
+        assert!(change_deleted, "the deleted attribute keeps an entity_change row");
+
+        // Deleting a nonexistent attribute is a silent success, like the real route.
+        delete_note_attribute(&conn, &note_a, "no-such-attribute").unwrap();
     }
 }

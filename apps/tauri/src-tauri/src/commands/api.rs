@@ -109,6 +109,13 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
                 })?;
                 Ok(json!({}))
             }
+            ["notes", note_id, "attributes", attribute_id] => {
+                db::write::delete_note_attribute(conn, note_id, attribute_id).map_err(|err| ApiError {
+                    status: err.status,
+                    message: err.message,
+                })?;
+                Ok(json!({}))
+            }
             ["notes", note_id] => delete_note_route(conn, app, note_id, query),
             _ => Err(not_found(&format!("No route for DELETE {url}"))),
         };
@@ -170,6 +177,13 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
         ["autocomplete"] => get_autocomplete(conn, query),
         ["search", search] => search_notes(conn, search),
         ["search-templates"] => get_search_templates(conn),
+        ["special-notes", "inbox", date] => get_special_note(conn, "inbox", date, query),
+        ["special-notes", "days", date] => get_special_note(conn, "day", date, query),
+        ["special-notes", "week-first-day", date] => get_week_first_day_note(conn, date, query),
+        ["special-notes", "weeks", week] => get_special_note(conn, "week", week, query),
+        ["special-notes", "months", month] => get_special_note(conn, "month", month, query),
+        ["special-notes", "quarters", quarter] => get_special_note(conn, "quarter", quarter, query),
+        ["special-notes", "years", year] => get_special_note(conn, "year", year, query),
         ["special-notes", "notes-for-month", month] => get_day_notes_for_month(conn, month, query),
         ["app-info"] => Ok(json!({
             "subVersion": "",
@@ -1242,6 +1256,42 @@ fn has_ancestor(conn: &rusqlite::Connection, note_id: &str, ancestor_id: &str) -
         )
         .optional()?;
     Ok(found == Some(1))
+}
+
+/// `GET /special-notes/{kind}/{key}` — the calendar/journal note for a period:
+/// `days` (a calendar day responsible for creating the month/week/year chain),
+/// `weeks`, `months`, `quarters`, `years` and `inbox` (the #inboxRoot-labeled note).
+/// Mirrors the `getInboxNote`/`getDayNote`/`get*Note` handlers in
+/// `packages/trilium-core/src/routes/api/special_notes.ts`: the note is returned
+/// as a row the client's `froca` can load, created (with its `#dateNote`-style
+/// labels) when it does not yet exist. Accepts `?calendarRootId` to scope the
+/// calendar root, like the real query param.
+fn get_special_note(
+    conn: &rusqlite::Connection,
+    kind: &str,
+    key: &str,
+    query: &str,
+) -> Result<Value, ApiError> {
+    let calendar_root_id = parse_param(query, "calendarRootId").map(str::to_string);
+    let note_id = db::write::get_special_period_note(conn, kind, key, calendar_root_id.as_deref())
+        .map_err(|err| ApiError {
+            status: err.status,
+            message: err.message,
+        })?;
+    note_row_value(conn, &note_id).ok_or_else(|| not_found(&format!("Note '{}' not found", note_id)))
+}
+
+/// `GET /special-notes/week-first-day/{date}` — the day note that starts the week
+/// containing `date`, under the configured calendar root.
+fn get_week_first_day_note(conn: &rusqlite::Connection, date: &str, query: &str) -> Result<Value, ApiError> {
+    let calendar_root_id = parse_param(query, "calendarRootId").map(str::to_string);
+    let start_date = db::write::get_week_start_date_for(conn, date);
+    let day_note = db::write::get_special_period_note(conn, "day", &start_date, calendar_root_id.as_deref())
+        .map_err(|err| ApiError {
+            status: err.status,
+            message: err.message,
+        })?;
+    note_row_value(conn, &day_note).ok_or_else(|| not_found(&format!("Note '{}' not found", day_note)))
 }
 
 /// `GET /notes/{id}/metadata` — the note's timestamps (mirrors `getNoteMetadata`).
