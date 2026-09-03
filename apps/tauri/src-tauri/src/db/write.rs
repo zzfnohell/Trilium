@@ -1402,8 +1402,9 @@ fn collect_note_and_descendants(conn: &Connection, note_id: &str, subtree: bool,
 
 /// Read a blob's stored bytes and, for a protected entity, decrypt them to the
 /// plaintext. TEXT and BLOB storage both come back as bytes here — string notes hold
-/// their content as TEXT, binary entities as BLOB.
-fn read_clear_bytes(conn: &Connection, blob_id: &str, was_protected: bool) -> rusqlite::Result<Vec<u8>> {
+/// their content as TEXT, binary entities as BLOB. `pub` because the media-serving
+/// command in `commands::api` reads attachment and image-note blobs the same way.
+pub fn read_clear_bytes(conn: &Connection, blob_id: &str, was_protected: bool) -> rusqlite::Result<Vec<u8>> {
     let stored: Option<Vec<u8>> = conn
         .query_row("SELECT content FROM blobs WHERE blobId = ?1", params![blob_id], |row| {
             match row.get::<_, rusqlite::types::Value>(0)? {

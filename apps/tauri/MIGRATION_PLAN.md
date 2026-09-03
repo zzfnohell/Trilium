@@ -134,7 +134,33 @@ bootstrap 负载中 `iconPackCss`/`iconRegistry` 原为空串/空对象，`loadI
 验证：`cargo test` 3 项单测全绿（CSS 含 @font-face/全部 icon 规则、assetPath 拼接、registry 全量）；
 实机启动 state dump `iconPackCssLen:72128`、`iconFontLoaded:true`、`failingLinks:[]`、`hasCritical:false`。
 
-### ✅ `options/user-themes` 路由补齐（本步骤，未提交）
+### ✅ 附件图片资源服务（本步骤，未提交）
+
+附件/图片资源的 `api/` URL 之前无任何服务：`<img src="api/attachments/{id}/image/...">`、
+convert 成 image note 后的 `api/images/{id}/...` 在 shell 中全部裂图，自定义图标包的字体路径
+`api/attachments/download/{id}` 也不存在。已对齐 `packages/trilium-core/src/routes/api/` 的
+`returnAttachedImage` / `downloadAttachment` / `returnImageInt`：
+
+- `commands/api.rs`：新 `get_api_media` IPC 命令 + 纯函数 `resolve_media_resource(conn, path)`，
+  解析 `attachments/{id}/image/{name}`（role 必须 `image`）、`attachments/{id}/download` 与
+  `attachments/download/{id}`（图标包字体、下载）、`images/{noteId}/{name}`（note type 限
+  image/canvas/mermaid/mindMap/spreadsheet）。二进制经 `db::write::read_clear_bytes`
+  （TEXT/BLOB 通吃、受保护时按会话解密/锁定返回空）读为字节，base64 过 IPC + 真实 mime。
+
+- `db/write.rs`：`read_clear_bytes` 转 `pub`（读附件/图片 note blob 复用）。
+
+- `main.rs`：`ELECTRON_BRIDGE_JS` 新增媒体拦截 —— MutationObserver（childList + `src`
+  属性 + 初始扫描）把 `<img>`/`video`/`audio` 的 `/api/` src 经 `get_api_media` 换成
+  `blob:` URL（带真实 mime），失败（如锁定中的受保护图）静默去掉 src。
+
+- 测试：`media_routes_serve_attachment_images_and_image_notes` 集成测试（`TRILIUM_VERIFY_SOURCE`
+  真实库副本插入 PNG 附件/image note 夹具，验证三臂 + 双 download 拼写 + 角色/类型门禁 +
+  无效路径）。`cargo test` 19 项全绿。
+
+仍受限：自定义图标包字体是 CSS 内 `url(api/attachments/download/{id})` 里的浏览器字体请求，
+DOM 钩子拦不到（非 link/img 元素），需要 await 用户真造一个 `#iconPack` 后再定方案。
+
+### ✅ `options/user-themes` 路由补齐（已提交 `f3a1548961`）
 
 `appearance.tsx` / `theme.ts` 启动即请求 `GET /options/user-themes`，之前被 dispatch 的通用
 `options/{name}` 臂吞掉，报 `Option 'user-themes' not found`（404）。已按
@@ -152,15 +178,14 @@ bootstrap 负载中 `iconPackCss`/`iconRegistry` 原为空串/空对象，`loadI
 
 - notes 写路由基建：`createNewNote`（已有内部基建，公开路由未接）、改名、删除/撤销删除。
 
-- 附件图片资源：`api/attachments/{id}/image/{name}` `<img>` 拦截（当前 shell 中图片不渲染，
-  convert 成 image note 后 `api/images/{id}/` 同样需拦截）、`image-info` 全量字段、`getAttachmentImageInfo` 配套。
-
 - `saveRevision` 附件版本管理：revision 快照连同附件一起版本化。
 
 - 自定义图标包（`#iconPack` 笔记）与 task-state 图标 CSS：当前只有内置 Boxicons 包；
   `icon_packs.rs` 尚未读自定义包的 JSON manifest/字体附件，`generateTaskStateCss`（`_taskStates`
-  子树 → `--task-state-glyph` 规则）也未生成。自定义包字体 URL
-  `api/attachments/download/{attachmentId}` 对应路由亦未实现。
+  子树 → `--task-state-glyph` 规则）也未生成。字体 URL `api/attachments/download/{attachmentId}`
+  路由已实现（见上），但 CSS 内 `url(...)` 的浏览器字体请求 DOM 钩子拦不到，需另想办法。
+
+- 附件 `image-info` 全量字段与 `getAttachmentImageInfo` 客户端配套。
 
 - 其他零碎：保护会话超时自动锁定、deleted-notes 读路由。
 
@@ -169,15 +194,14 @@ bootstrap 负载中 `iconPackCss`/`iconRegistry` 原为空串/空对象，`loadI
 未提交改动（不 push，用户确认后才 commit）：
 
 ```
- M apps/tauri/src-tauri/src/main.rs                 # state dump 加 iconPackCssLen/iconFontLoaded 诊断
- M apps/tauri/src-tauri/src/commands/bootstrap.rs   # iconPackCss/iconRegistry 真实输出
- M apps/tauri/src-tauri/src/icon_packs.rs           # 新：内置 Boxicons 包 CSS + registry + 单测
- M apps/tauri/src-tauri/src/commands/api.rs         # options/user-themes 路由 + 单测/集成测试
+ M apps/tauri/src-tauri/src/commands/api.rs         # get_api_media 命令 + resolve_media_resource 三臂 + 集成测试
+ M apps/tauri/src-tauri/src/db/write.rs             # read_clear_bytes 转 pub（媒体读复用）
+ M apps/tauri/src-tauri/src/main.rs                 # 注册 get_api_media；JS 媒体拦截（MutationObserver）
  M apps/tauri/MIGRATION_PLAN.md
 ```
 
 已提交：`93884c5e9e`（受保护笔记）、`1f6c330c24`（multipart+convert）、`cba58ecaac`、`b88c672df8`、
-`471d7296d9`（.gitattributes LF 修复）等。
+`f3a1548961`（options/user-themes）、`f9c3e5731b`（Boxicons 图标包）、`471d7296d9`（.gitattributes LF 修复）等。
 
 ## 约定
 

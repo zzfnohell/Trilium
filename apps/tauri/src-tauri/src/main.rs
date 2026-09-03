@@ -224,6 +224,71 @@ const ELECTRON_BRIDGE_JS: &str = r#"
         });
     })();
 
+    // Media sources (`<img>`, video, audio) pointing at `api/attachments/...`,
+    // `api/images/...` or `api/attachments/download/...` hit the same dead path —
+    // no server answers `http://tauri.localhost/api/...`. Fetch the bytes over IPC
+    // instead and re-serve the element as a `blob:` URL carrying the entity's real
+    // MIME type, mirroring the stylesheet interception above. A MutationObserver
+    // catches every way the renderer can put an `api/` source on a media element —
+    // property set, setAttribute, jQuery, innerHTML and `new Image()` — including
+    // the note images (`api/images/{id}/...`) that converting an uploaded attachment
+    // into an image note leaves in the content.
+    (function () {
+        var apiPath = function (url) {
+            if (typeof url !== 'string') return null;
+            var i = url.indexOf('/api/');
+            var base = i >= 0 ? url.slice(i + 5) : (url.indexOf('api/') === 0 ? url.slice(4) : null);
+            if (base === null) return null;
+            return base.split('?')[0]; // drop cache-busting queries like `?1234`
+        };
+        var loadMedia = function (el, path) {
+            if (el.__triliumMediaServed) return;
+            el.__triliumMediaServed = true;
+            window.__TAURI__.core.invoke('get_api_media', { path: path })
+                .then(function (res) {
+                    var chars = atob(res.base64);
+                    var bytes = new Uint8Array(chars.length);
+                    for (var i = 0; i < chars.length; i++) bytes[i] = chars.charCodeAt(i);
+                    var blobUrl = URL.createObjectURL(new Blob([bytes], { type: res.mimeType }));
+                    el.setAttribute('src', blobUrl);
+                })
+                .catch(function () {
+                    // A failed resource (e.g. a protected image while the session is
+                    // locked) is served as nothing rather than left loading forever.
+                    el.removeAttribute('src');
+                });
+        };
+        var maybe = function (el) {
+            if (el.nodeType !== 1 || (el.tagName !== 'IMG' && el.tagName !== 'VIDEO' && el.tagName !== 'AUDIO')) return;
+            var src = el.getAttribute('src');
+            if (src && src.indexOf('/api/') >= 0) loadMedia(el, src);
+        };
+        new MutationObserver(function (records) {
+            for (var i = 0; i < records.length; i++) {
+                var rec = records[i];
+                if (rec.type === 'childList') {
+                    var nodes = rec.addedNodes;
+                    for (var j = 0; j < nodes.length; j++) {
+                        var node = nodes[j];
+                        if (node.nodeType !== 1) continue;
+                        maybe(node);
+                        var found = node.querySelectorAll ? node.querySelectorAll('img, video, audio') : [];
+                        for (var k = 0; k < found.length; k++) maybe(found[k]);
+                    }
+                } else {
+                    maybe(rec.target);
+                }
+            }
+        }).observe(document.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['src']
+        });
+        var existing = document.querySelectorAll('img[src], video[src], audio[src]');
+        for (var i = 0; i < existing.length; i++) maybe(existing[i]);
+    })();
+
     // Periodic renderer state dumps at a few ages — a single 4s snapshot says nothing about whether
     // the desktop module (which imports note-autocomplete etc. over the network) finishes later.
     function dumpState() {
@@ -275,6 +340,7 @@ fn main() {
             commands::bootstrap::log_frontend_error,
             commands::api::api,
             commands::api::get_api_resource,
+            commands::api::get_api_media,
             commands::ws::ws_send
         ])
         .setup(|app| {

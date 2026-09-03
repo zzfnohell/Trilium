@@ -258,6 +258,86 @@ pub fn get_api_resource(
     }
 }
 
+/// A binary resource served to the renderer (attachment images, image-note
+/// content, raw attachment downloads). IPC is JSON, so the bytes cross the
+/// bridge base64-encoded; the frontend decodes them into a `blob:` URL carrying
+/// `mime_type`.
+#[derive(Serialize)]
+pub struct MediaResource {
+    pub mime_type: String,
+    pub base64: String,
+}
+
+/// Resource-request handler for binary media — the image twin of
+/// `get_api_resource`. Covers the three `api/` URLs the renderer puts into
+/// `<img>` / `<video>` / `<audio>` `src` (and font sources in icon-pack CSS):
+/// `attachments/{id}/image/{name}`, `attachments/{id}/download` (plus the
+/// `attachments/download/{id}` spelling the icon-pack CSS uses), and
+/// `images/{noteId}/{name}` for actual image notes.
+#[tauri::command]
+pub fn get_api_media(state: State<'_, AppState>, path: String) -> Result<MediaResource, String> {
+    let guard = state.db.lock().expect("db lock");
+    let conn = guard
+        .as_ref()
+        .ok_or_else(|| "database unavailable".to_string())?;
+    resolve_media_resource(conn, &path)
+}
+
+/// Resolve an `api/` media path to mime + base64 bytes. Shared by the command
+/// wrapper and the tests, so the path rules can be verified without a Tauri
+/// `State`. Mirrors `returnAttachedImage` / `downloadAttachment` /
+/// `returnImageInt` in `packages/trilium-core/src/routes/api/`:
+/// the attachment-image arm only serves `image`-role attachments, the image-note
+/// arm only serves known image-ish note types. Protected entities decrypt when
+/// the session is open and yield empty bytes while locked.
+fn resolve_media_resource(conn: &rusqlite::Connection, path: &str) -> Result<MediaResource, String> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    let (blob_id, is_protected, mime): (String, bool, String) = match segments.as_slice() {
+        // Attachment <img> source — `api/attachments/{id}/image/{name}?{ts}`.
+        ["attachments", attachment_id, "image", _] | ["attachments", attachment_id, "image"] => {
+            let attachment = db::get_attachment(conn, attachment_id)
+                .map_err(|err| format!("failed to load attachment: {err}"))?
+                .ok_or_else(|| format!("Attachment '{attachment_id}' not found"))?;
+            if attachment.role != "image" {
+                return Err(format!("Attachment '{attachment_id}' is not an image"));
+            }
+            let blob_id = attachment
+                .blob_id
+                .ok_or_else(|| format!("Attachment '{attachment_id}' has no blob"))?;
+            (blob_id, attachment.is_protected, attachment.mime)
+        }
+        // Raw attachment bytes — the custom icon-pack font URL and downloads.
+        ["attachments", attachment_id, "download"] | ["attachments", "download", attachment_id] => {
+            let attachment = db::get_attachment(conn, attachment_id)
+                .map_err(|err| format!("failed to load attachment: {err}"))?
+                .ok_or_else(|| format!("Attachment '{attachment_id}' not found"))?;
+            let blob_id = attachment
+                .blob_id
+                .ok_or_else(|| format!("Attachment '{attachment_id}' has no blob"))?;
+            (blob_id, attachment.is_protected, attachment.mime)
+        }
+        // Image-note <img> source — `api/images/{noteId}/{name}?{ts}`.
+        ["images", note_id, _] | ["images", note_id] => {
+            let note = db::get_note(conn, note_id).ok_or_else(|| format!("Note '{note_id}' not found"))?;
+            const IMAGE_TYPES: [&str; 5] = ["image", "canvas", "mermaid", "mindMap", "spreadsheet"];
+            if !IMAGE_TYPES.contains(&note.note_type.as_str()) {
+                return Err(format!("Note '{note_id}' is not an image"));
+            }
+            let blob_id = note.blob_id.ok_or_else(|| format!("Note '{note_id}' has no blob"))?;
+            (blob_id, note.is_protected, note.mime)
+        }
+        _ => return Err(format!("Resource not found: {path}")),
+    };
+
+    let bytes = db::write::read_clear_bytes(conn, &blob_id, is_protected)
+        .map_err(|err| format!("failed to read blob '{blob_id}': {err}"))?;
+    Ok(MediaResource {
+        mime_type: mime,
+        base64: BASE64.encode(bytes),
+    })
+}
+
 /// Build the `api/fonts` CSS from the font-family/size options, mirroring the
 /// original `/api/fonts` route: only emitted when `overrideThemeFonts` is on,
 /// mapping each family option (`theme`/`system`/a concrete stack) onto the
@@ -1278,6 +1358,100 @@ mod tests {
         assert_eq!(item["title"], "My Cool Theme");
         assert_eq!(item["appThemeBase"], "next");
         assert_eq!(item["icon"], "bx bxs-palette");
+    }
+
+    /// Integration verification of the media-serving paths against a copy of a
+    /// real database (set `TRILIUM_VERIFY_SOURCE` to a real `document.db` to
+    /// enable). Inserts an image attachment, a `file`-role attachment and an image
+    /// note, then checks each `api/` URL shape against `resolve_media_resource` —
+    /// the attachment-image arm only serves `image`-role attachments, the note arm
+    /// only serves image-ish note types, and downloads answer in both spellings.
+    #[test]
+    fn media_routes_serve_attachment_images_and_image_notes() {
+        let Ok(src) = std::env::var("TRILIUM_VERIFY_SOURCE") else {
+            eprintln!("TRILIUM_VERIFY_SOURCE not set; integration verification skipped");
+            return;
+        };
+        let conn = copy_db(&src);
+        let local = local_now();
+        let utc = utc_now();
+
+        // A host text note to own the attachments.
+        conn.execute(
+            "INSERT INTO notes (noteId, title, isProtected, type, mime, isDeleted, dateCreated, \
+             dateModified, utcDateCreated, utcDateModified) \
+             VALUES ('fix-img-owner', 'owner', 0, 'text', 'text/html', 0, ?1, ?2, ?3, ?4)",
+            rusqlite::params![local, local, utc, utc],
+        )
+        .unwrap();
+
+        // A PNG header, deliberately binary so the round-trip proves byte-ness.
+        let png: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R',
+            0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08,
+        ];
+        for (index, (blob_id, attachment_id, role)) in [
+            ("fix-blob-img", "fix-att-img", "image"),
+            ("fix-blob-file", "fix-att-file", "file"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO blobs (blobId, content, dateModified, utcDateModified) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![blob_id, png, local, utc],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO attachments (attachmentId, ownerId, role, mime, title, isProtected, \
+                 position, blobId, dateModified, utcDateModified, isDeleted) \
+                 VALUES (?1, 'fix-img-owner', ?2, 'image/png', 'photo.png', 0, ?3, ?4, ?5, ?6, 0)",
+                rusqlite::params![attachment_id, role, index as i64, blob_id, local, utc],
+            )
+            .unwrap();
+        }
+
+        // An image note (the `api/images/{id}/...` shape) with the same bytes.
+        conn.execute(
+            "INSERT INTO blobs (blobId, content, dateModified, utcDateModified) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["fix-blob-note", png, local, utc],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notes (noteId, title, isProtected, type, mime, blobId, isDeleted, \
+             dateCreated, dateModified, utcDateCreated, utcDateModified) \
+             VALUES ('fix-img-note', 'photo', 0, 'image', 'image/png', 'fix-blob-note', 0, ?1, ?2, ?3, ?4)",
+            rusqlite::params![local, local, utc, utc],
+        )
+        .unwrap();
+
+        let expected = BASE64.encode(&png);
+
+        // Attachment <img> source serves the blob with the attachment's mime.
+        let image = resolve_media_resource(&conn, "attachments/fix-att-img/image/photo.png").unwrap();
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.base64, expected);
+
+        // Raw downloads answer in both spellings (the icon-pack font URL is the
+        // `attachments/download/{id}` one) with the same bytes.
+        for path in ["attachments/fix-att-img/download", "attachments/download/fix-att-img"] {
+            let download = resolve_media_resource(&conn, path).unwrap();
+            assert_eq!(download.mime_type, "image/png");
+            assert_eq!(download.base64, expected);
+        }
+
+        // Image-note source serves the note's blob with the note's mime; the
+        // cache-busting query is tolerated.
+        let note_image = resolve_media_resource(&conn, "images/fix-img-note/photo.png?1234").unwrap();
+        assert_eq!(note_image.mime_type, "image/png");
+        assert_eq!(note_image.base64, expected);
+
+        // The image arm rejects a non-image attachment, the note arm a non-image
+        // note, and unknown paths fail outright.
+        assert!(resolve_media_resource(&conn, "attachments/fix-att-file/image/x.png").is_err());
+        assert!(resolve_media_resource(&conn, "images/fix-img-owner/x.png").is_err());
+        assert!(resolve_media_resource(&conn, "attachments/nope/image/x.png").is_err());
+        assert!(resolve_media_resource(&conn, "no-such-path").is_err());
     }
 
     #[test]
