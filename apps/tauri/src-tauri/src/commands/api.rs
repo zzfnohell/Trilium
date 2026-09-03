@@ -18,6 +18,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{Duration, Utc};
 use rand::Rng;
+use rusqlite::OptionalExtension;
 
 use crate::db::{self, tree};
 use crate::messages;
@@ -90,6 +91,8 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
             ["attachments", attachment_id, "rename"] => rename_attachment_route(conn, attachment_id, data),
             ["attachments", attachment_id, "file"] => update_attachment_file_route(conn, attachment_id, data),
             ["images", note_id] => update_image_route(conn, note_id, data),
+            ["options"] => put_options_route(conn, data),
+            ["options", name, value] => put_option_route(conn, name, value),
             _ => Err(not_found(&format!("No route for PUT {url}"))),
         };
     }
@@ -158,6 +161,7 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
         ["autocomplete"] => get_autocomplete(conn, query),
         ["search", search] => search_notes(conn, search),
         ["search-templates"] => get_search_templates(conn),
+        ["special-notes", "notes-for-month", month] => get_day_notes_for_month(conn, month, query),
         ["app-info"] => Ok(json!({
             "subVersion": "",
             "buildRevision": "tauri",
@@ -349,6 +353,34 @@ fn get_single_option(conn: &rusqlite::Connection, name: &str) -> Result<Value, A
     db::get_option(conn, name)
         .map(Value::String)
         .ok_or_else(|| not_found(&format!("Option '{}' not found", name)))
+}
+
+/// `PUT /options` — `updateOptions`: persist the flat `{ name: value }` map the client
+/// sends (tab-state like `openNoteContexts`, layout widths, seen call-to-actions). The
+/// real route validates names against its `ALLOWED_OPTIONS` list; the client only ever
+/// writes options from that list, so persisting what arrives is the faithful outcome.
+fn put_options_route(conn: &rusqlite::Connection, data: &Option<Value>) -> Result<Value, ApiError> {
+    let Some(object) = data.as_ref().and_then(Value::as_object) else {
+        return Err(bad_request("Expected an object payload for options"));
+    };
+    for (name, value) in object {
+        db::set_option(conn, name, value.as_str().unwrap_or("")).map_err(|err| ApiError {
+            status: 500,
+            message: format!("failed to store option '{name}': {err}"),
+        })?;
+    }
+    Ok(json!({}))
+}
+
+/// `PUT /options/{name}/{value}` — `updateOption` for a single option (URL-encoded value).
+fn put_option_route(conn: &rusqlite::Connection, name: &str, value: &str) -> Result<Value, ApiError> {
+    let name = percent_decode(name);
+    let value = percent_decode(value);
+    db::set_option(conn, &name, &value).map_err(|err| ApiError {
+        status: 500,
+        message: format!("failed to store option '{name}': {err}"),
+    })?;
+    Ok(json!({}))
 }
 
 /// Parse a URL-decoded query parameter's value. Values in these URLs are simple
@@ -871,6 +903,56 @@ fn get_search_templates(conn: &rusqlite::Connection) -> Result<Value, ApiError> 
         "templateNoteIds": template_note_ids,
         "newTemplateNoteIds": new_template_note_ids,
     }))
+}
+
+/// `GET /special-notes/notes-for-month/{month}` — the calendars' day notes for a month:
+/// every note with a `#dateNote` label whose value starts with `YYYY-MM`. With a
+/// `calendarRoot` query the collection calendar shows only notes under that root, so the
+/// result is filtered to those that have it as an ancestor — `getDayNotesForMonth`.
+fn get_day_notes_for_month(conn: &rusqlite::Connection, month: &str, query: &str) -> Result<Value, ApiError> {
+    let calendar_root = parse_param(query, "calendarRoot").map(str::to_string);
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT attr.value AS date, notes.noteId FROM notes JOIN attributes attr USING (noteId) \
+             WHERE notes.isDeleted = 0 AND attr.isDeleted = 0 AND attr.type = 'label' \
+               AND attr.name = 'dateNote' AND attr.value LIKE ?1 || '%'",
+        )
+        .map_err(|err| ApiError { status: 500, message: format!("failed to query day notes: {err}") })?;
+    let rows = stmt
+        .query_map([month], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|err| ApiError { status: 500, message: format!("failed to query day notes: {err}") })?;
+
+    let mut result = serde_json::Map::new();
+    for row in rows.flatten() {
+        if let Some(root) = &calendar_root {
+            match has_ancestor(conn, &row.1, root) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(err) => return Err(ApiError { status: 500, message: format!("failed to walk ancestors: {err}") }),
+            }
+        }
+        result.insert(row.0, Value::String(row.1));
+    }
+    Ok(Value::Object(result))
+}
+
+/// Whether `note_id` has `ancestor_id` among its parents — `BNote.hasAncestor`, walking
+/// the branch table upward through non-deleted branches.
+fn has_ancestor(conn: &rusqlite::Connection, note_id: &str, ancestor_id: &str) -> rusqlite::Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "WITH RECURSIVE anc(noteId) AS ( \
+               SELECT ?1 \
+               UNION \
+               SELECT b.parentNoteId FROM branches b JOIN anc ON b.noteId = anc.noteId AND b.isDeleted = 0 \
+             ) \
+             SELECT 1 FROM anc WHERE noteId = ?2 LIMIT 1",
+            rusqlite::params![note_id, ancestor_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found == Some(1))
 }
 
 /// `GET /notes/{id}/metadata` — the note's timestamps (mirrors `getNoteMetadata`).
