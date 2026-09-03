@@ -56,13 +56,21 @@ pub fn api(state: State<'_, AppState>, app: AppHandle, method: String, url: Stri
     // Tauri invoke for every non-2xx (404 on an untranslated route, 405 on a write) would ship the
     // error as an opaque JSON string to the client bridge; wrapping keeps the status code intact so
     // `server.ts` can apply its normal silent-not-found / error-toast logic unchanged.
-    match result {
+    let wrapper = match result {
         Ok(body) => json!({ "status": 200, "body": body }),
         Err(err) => {
             let message = err.message;
             json!({ "status": err.status, "body": { "message": message } })
         }
-    }
+    };
+    // Route trace on the terminal: which API routes the frontend actually hits, with their
+    // HTTP status — the webview has no devtools console attached, so this is the way to watch
+    // write paths (uploads, convert-to-note) succeed or fail during a manual walkthrough.
+    eprintln!(
+        "[api] {method} {url} -> {}",
+        wrapper["status"].as_i64().unwrap_or(-1)
+    );
+    wrapper
 }
 
 fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &str, data: &Option<Value>) -> Result<Value, ApiError> {
@@ -149,6 +157,7 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
         ["options", name] => get_single_option(conn, name),
         ["autocomplete"] => get_autocomplete(conn, query),
         ["search", search] => search_notes(conn, search),
+        ["search-templates"] => get_search_templates(conn),
         ["app-info"] => Ok(json!({
             "subVersion": "",
             "buildRevision": "tauri",
@@ -824,6 +833,44 @@ fn search_notes(conn: &rusqlite::Connection, encoded: &str) -> Result<Value, Api
     Ok(Value::Array(
         note_ids.into_iter().map(Value::String).collect(),
     ))
+}
+
+/// `GET /search-templates` — the note-type chooser's template catalogue: every note carrying a
+/// `#template`/`#workspaceTemplate` label (archived included, mirroring `includeArchivedNotes`),
+/// with the "new" flag set only for those still loadable (not deleted). The client builds the
+/// create-note menu from this on boot, so an un-answered 404 turns into an unhandled rejection.
+fn get_search_templates(conn: &rusqlite::Connection) -> Result<Value, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT a.noteId FROM attributes a JOIN notes n USING (noteId) \
+             WHERE a.type = 'label' AND a.name IN ('template', 'workspaceTemplate') AND a.isDeleted = 0",
+        )
+        .map_err(|err| ApiError { status: 500, message: format!("failed to query templates: {err}") })?;
+    let mut template_note_ids: Vec<String> = Vec::new();
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| ApiError { status: 500, message: format!("failed to query templates: {err}") })?;
+    for row in rows.flatten() {
+        template_note_ids.push(row);
+    }
+
+    let new_template_note_ids: Vec<String> = template_note_ids
+        .iter()
+        .filter(|id| {
+            conn.query_row(
+                "SELECT 1 FROM notes WHERE noteId = ?1 AND isDeleted = 0",
+                [id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok()
+        })
+        .cloned()
+        .collect();
+
+    Ok(json!({
+        "templateNoteIds": template_note_ids,
+        "newTemplateNoteIds": new_template_note_ids,
+    }))
 }
 
 /// `GET /notes/{id}/metadata` — the note's timestamps (mirrors `getNoteMetadata`).
