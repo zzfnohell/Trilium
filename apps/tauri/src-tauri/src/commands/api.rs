@@ -157,6 +157,9 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
         ["notes", note_id] => get_note(conn, note_id),
         ["notes", "download", note_id] => get_download(conn, note_id),
         ["options"] => Ok(get_options(conn)),
+        // `user-themes` is not a stored option — it is the list of notes tagged
+        // `#appTheme`; route it before the generic `options/{name}` lookup.
+        ["options", "user-themes"] => get_user_themes(conn),
         ["options", name] => get_single_option(conn, name),
         ["autocomplete"] => get_autocomplete(conn, query),
         ["search", search] => search_notes(conn, search),
@@ -353,6 +356,47 @@ fn get_single_option(conn: &rusqlite::Connection, name: &str) -> Result<Value, A
     db::get_option(conn, name)
         .map(Value::String)
         .ok_or_else(|| not_found(&format!("Option '{}' not found", name)))
+}
+
+/// `GET /options/user-themes` — every note carrying an `#appTheme` label, as the
+/// client's `CustomTheme` list (appearance options, theme switcher). Mirrors
+/// `getUserThemes` in `packages/trilium-core/src/routes/api/options.ts`: `val` is
+/// the owned `appTheme` label value (a slug of the title when missing), plus the
+/// optional `appThemeBase` the theme derives from. Not a stored option, so it is
+/// dispatched before the generic `options/{name}` lookup.
+fn get_user_themes(conn: &rusqlite::Connection) -> Result<Value, ApiError> {
+    let mut ret = Vec::new();
+    for note_id in db::get_note_ids_with_label(conn, "appTheme") {
+        let Some(note) = db::get_note(conn, &note_id) else {
+            continue;
+        };
+        let value = db::get_label_value(conn, &note_id, "appTheme")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| slugify_title(&note.title));
+        let mut item = json!({
+            "val": value,
+            "title": session::title_or_mask(note.is_protected, note.title),
+            "noteId": note_id,
+        });
+        if let Some(icon) = db::get_note_icon(conn, &note_id) {
+            item["icon"] = json!(icon);
+        }
+        if let Some(base) = db::get_label_value(conn, &note_id, "appThemeBase") {
+            item["appThemeBase"] = json!(base);
+        }
+        ret.push(item);
+    }
+    Ok(Value::Array(ret))
+}
+
+/// The title-slug fallback for a theme's `val` — `title.toLowerCase()` with every
+/// non-alphanumeric character replaced by `-` (clients apply the same rule).
+fn slugify_title(title: &str) -> String {
+    title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// `PUT /options` — `updateOptions`: persist the flat `{ name: value }` map the client
@@ -1155,6 +1199,86 @@ fn bad_request(message: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
+    use std::io::Read;
+
+    /// Copy a real Trilium database to a fresh temp file and open it read-write, so
+    /// fixture inserts never touch the source (same recipe as `db::write::tests`).
+    fn copy_db(src: &str) -> rusqlite::Connection {
+        let mut buf = Vec::new();
+        std::fs::File::open(src).unwrap().read_to_end(&mut buf).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "trilium-verify-userthemes-{}.db",
+            rand::thread_rng().gen_range(0u32..1_000_000)
+        ));
+        std::fs::write(&path, &buf).unwrap();
+        rusqlite::Connection::open(&path).unwrap()
+    }
+
+    fn utc_now() -> String {
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3fZ").to_string()
+    }
+
+    fn local_now() -> String {
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    }
+
+    #[test]
+    fn slugify_title_matches_the_js_rule() {
+        // `title.toLowerCase().replace(/[^a-z0-9]/gi, "-")` — ASCII alphanumerics
+        // survive, everything else (spaces, punctuation, non-ASCII) becomes a dash.
+        assert_eq!(slugify_title("My Cool Theme!"), "my-cool-theme-");
+        assert_eq!(slugify_title("  A—B  "), "--a-b--");
+        assert_eq!(slugify_title("42"), "42");
+    }
+
+    /// Integration verification of `GET /options/user-themes` against a copy of a
+    /// real database. Set `TRILIUM_VERIFY_SOURCE` to a real `document.db` path to
+    /// enable; otherwise the test is reported as run-and-skipped.
+    #[test]
+    fn user_themes_lists_apptheme_notes() {
+        let Ok(src) = std::env::var("TRILIUM_VERIFY_SOURCE") else {
+            eprintln!("TRILIUM_VERIFY_SOURCE not set; integration verification skipped");
+            return;
+        };
+        let conn = copy_db(&src);
+
+        // A self-contained fixture theme note with the `#appTheme` label and the two
+        // optional labels the route surface (`#appThemeBase`, `#icon`).
+        let local = local_now();
+        let utc = utc_now();
+        conn.execute(
+            "INSERT INTO notes (noteId, title, isProtected, type, mime, isDeleted, dateCreated, \
+             dateModified, utcDateCreated, utcDateModified) \
+             VALUES ('fix-theme-note', 'My Cool Theme', 0, 'code', 'text/html', 0, ?1, ?2, ?3, ?4)",
+            rusqlite::params![local, local, utc, utc],
+        )
+        .unwrap();
+        for (attribute_id, name, value) in [
+            ("fix-attr-app", "appTheme", "my-cool-theme"),
+            ("fix-attr-base", "appThemeBase", "next"),
+            ("fix-attr-icon", "icon", "bx bxs-palette"),
+        ] {
+            conn.execute(
+                "INSERT INTO attributes (attributeId, noteId, type, name, value, position, \
+                 utcDateModified, isDeleted) VALUES (?1, 'fix-theme-note', 'label', ?2, ?3, 1, ?4, 0)",
+                rusqlite::params![attribute_id, name, value, utc],
+            )
+            .unwrap();
+        }
+
+        let themes = get_user_themes(&conn).unwrap();
+        let item = themes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["noteId"] == "fix-theme-note")
+            .expect("fixture theme note listed");
+        assert_eq!(item["val"], "my-cool-theme");
+        assert_eq!(item["title"], "My Cool Theme");
+        assert_eq!(item["appThemeBase"], "next");
+        assert_eq!(item["icon"], "bx bxs-palette");
+    }
 
     #[test]
     fn image_geometry_reads_png_gif_jpeg_headers() {

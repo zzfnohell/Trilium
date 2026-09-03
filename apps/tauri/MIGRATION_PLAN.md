@@ -134,6 +134,20 @@ bootstrap 负载中 `iconPackCss`/`iconRegistry` 原为空串/空对象，`loadI
 验证：`cargo test` 3 项单测全绿（CSS 含 @font-face/全部 icon 规则、assetPath 拼接、registry 全量）；
 实机启动 state dump `iconPackCssLen:72128`、`iconFontLoaded:true`、`failingLinks:[]`、`hasCritical:false`。
 
+### ✅ `options/user-themes` 路由补齐（本步骤，未提交）
+
+`appearance.tsx` / `theme.ts` 启动即请求 `GET /options/user-themes`，之前被 dispatch 的通用
+`options/{name}` 臂吞掉，报 `Option 'user-themes' not found`（404）。已按
+`packages/trilium-core/src/routes/api/options.ts` 的 `getUserThemes` 对齐：
+
+- `commands/api.rs`：dispatch 在 `["options", name]` 之前新增 `["options", "user-themes"]` 臂；
+  `get_user_themes` 列出所有带 `#appTheme` 标签的笔记（`val`=owned `appTheme` 值，缺省时用标题
+  slug 化，`[^a-z0-9]`→`-`），附 `title`（受保护掩码）、`noteId`、可选 `icon`/`appThemeBase`。
+
+- 测试：`slugify_title_matches_the_js_rule`（纯函数）+ `user_themes_lists_apptheme_notes`
+  （`TRILIUM_VERIFY_SOURCE` 真实库副本插入夹具主题笔记验证字段）。`cargo test` 18 项全绿
+  （含对真实 `document.db` 副本跑通的集成项）。
+
 ### ⏳ 待办（后续步骤）
 
 - notes 写路由基建：`createNewNote`（已有内部基建，公开路由未接）、改名、删除/撤销删除。
@@ -158,6 +172,7 @@ bootstrap 负载中 `iconPackCss`/`iconRegistry` 原为空串/空对象，`loadI
  M apps/tauri/src-tauri/src/main.rs                 # state dump 加 iconPackCssLen/iconFontLoaded 诊断
  M apps/tauri/src-tauri/src/commands/bootstrap.rs   # iconPackCss/iconRegistry 真实输出
  M apps/tauri/src-tauri/src/icon_packs.rs           # 新：内置 Boxicons 包 CSS + registry + 单测
+ M apps/tauri/src-tauri/src/commands/api.rs         # options/user-themes 路由 + 单测/集成测试
  M apps/tauri/MIGRATION_PLAN.md
 ```
 
