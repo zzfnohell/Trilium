@@ -224,9 +224,23 @@ DOM 钩子拦不到（非 link/img 元素），需要 await 用户真造一个 `
 未纳入本步：`sort-children`、`duplicate`、`convert-format`、revision 子路由、
 `titleTemplate` 求值、删除前预览（`delete-notes-preview`）。
 
-### ⏳ 待办（后续步骤）
+### ✅ `saveRevision` 附件版本化（本步骤，未提交）
 
-- `saveRevision` 附件版本管理：revision 快照连同附件一起版本化。
+`BNote.saveRevision` 现在会把快照连同附件一起版本化（`db/write.rs::create_revision`），
+`cargo check` 零警告、`cargo test` 24 项全绿（含真实库副本新增集成测试
+`revision_snapshots_copy_attachments`）：
+
+- 快照时读 note 全部非删除附件，逐个 `copy_attachment` 为**以 revisionId 为 ownerId**
+  的新行（新 attachmentId、共享源 blob），对齐原版 `attachment.copy() + setContent(forceSave)`。
+- 文本型 note 的内容改写：`attachments/{oldId}` → `attachments/{newId}`，
+  `href="…attachmentId={oldId}…"` → `href="api/attachments/{newId}/download"`；
+  内容真正变化时 revision 持有自己的 blob（dedup + 受保护加密走 `store_entity_content`），
+  无附件/无引用变化时仍复用 note 的 blob（不新建）。
+- 所有调用 `create_revision` 的快照路径（edit-save、改名、file/image 替换）一并受益。
+- 已知取舍：受保护附件的 revision 副本直接复用源 ciphertext blob（原版会重加密形成
+  不同 blobId），语义等价、blob 更省；revision 读/恢复路由仍属待办。
+
+### ⏳ 待办（后续步骤）
 
 - 自定义图标包（`#iconPack` 笔记）与 task-state 图标 CSS：当前只有内置 Boxicons 包；
   `icon_packs.rs` 尚未读自定义包的 JSON manifest/字体附件，`generateTaskStateCss`（`_taskStates`

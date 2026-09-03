@@ -375,15 +375,57 @@ fn save_revision_if_needed(conn: &Connection, note: &WriteNote) -> rusqlite::Res
     Ok(())
 }
 
-/// `BNote.saveRevision` for the common case (no attachments): write a revisions row
-/// pointing at the note's current (unchanged) blob, plus its entity change, then trim
-/// excess snapshots. Content is byte-identical to the note's current blob, so the same
-/// blobId is reused and no new blob/entity-change is created.
+/// `BNote.saveRevision`: write a revisions row plus its entity change, snapshoting the
+/// note's attachments *with* the revision — each attachment is copied to a fresh row
+/// owned by the revision id (pointing at the same blob), and a text note's content is
+/// rewritten so its attachment references point at the copies, which then carries its
+/// own blob. A snapshot without attachments (or without references to change) reuses
+/// the note's blob and creates no new blob. Excess snapshots are trimmed afterwards.
 fn create_revision(conn: &Connection, note: &WriteNote) -> rusqlite::Result<()> {
     let revision_id = random_string(12);
     let utc = utc_now();
     let local = local_now();
-    let blob_id = note.blob_id.as_deref().unwrap_or("");
+
+    // Attachments are versioned along with the snapshot: every (non-deleted) attachment
+    // of the note is copied under the revision as its owner, sharing the source blob.
+    let mut stmt = conn.prepare(
+        "SELECT attachmentId, role, mime, title, COALESCE(blobId, ''), isProtected \
+         FROM attachments WHERE ownerId = ?1 AND isDeleted = 0",
+    )?;
+    let attachments: Vec<(String, String, String, String, String, i64)> = stmt
+        .query_map(params![note.note_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut copied: Vec<(String, String)> = Vec::with_capacity(attachments.len());
+    for (attachment_id, role, mime, title, attachment_blob, is_protected) in &attachments {
+        let copy_id = copy_attachment(conn, &revision_id, role, mime, title, attachment_blob, *is_protected != 0)?;
+        copied.push((attachment_id.clone(), copy_id));
+    }
+
+    // The text note's content is rewritten to reference the revision copies
+    // (`attachments/{oldId}` → `attachments/{newId}`, and reference-link hrefs collapse
+    // to download URLs). Only a note whose content actually changed gets its own blob.
+    let blob_id = if note.note_type == "text" && !copied.is_empty() {
+        let bytes = read_clear_bytes(conn, note.blob_id.as_deref().unwrap_or(""), note.is_protected)?;
+        let original = String::from_utf8_lossy(&bytes).into_owned();
+        let mut content = original.clone();
+        for (old_id, new_id) in &copied {
+            content = content.replace(&format!("attachments/{old_id}"), &format!("attachments/{new_id}"));
+            let href_re = Regex::new(&format!(r#"href="[^"]*attachmentId={old_id}[^"]*""#)).unwrap();
+            content = href_re
+                .replace_all(&content, format!(r#"href="api/attachments/{new_id}/download""#))
+                .into_owned();
+        }
+        if content != original {
+            store_entity_content(conn, note.is_protected, true, content.as_bytes(), &local, &utc)?
+        } else {
+            note.blob_id.clone().unwrap_or_default()
+        }
+    } else {
+        note.blob_id.clone().unwrap_or_default()
+    };
 
     conn.execute(
         "INSERT INTO revisions \
@@ -4356,13 +4398,35 @@ mod tests {
             .unwrap();
         assert_eq!(erased, 1, "the note's entity change must be marked erased");
 
-        // An orphaned note (parent deleted too) can only be restored under a fallback parent.
-        let orphan = create_note_with_target(
+        // A note with a *dedicated* parent: deleting that parent leaves the note an
+        // orphan, which can then only be restored under an explicit fallback parent.
+        let orphan_parent = create_note_with_target(
             &conn,
             "into",
             None,
             NoteCreateParams {
                 parent_note_id: parent.clone(),
+                title: Some("Orphan parent".to_string()),
+                note_type: None,
+                mime: None,
+                content: String::new(),
+                is_protected: false,
+                is_expanded: false,
+                prefix: None,
+                note_position: None,
+                note_id: None,
+                template_note_id: None,
+                attributes: Vec::new(),
+                ignore_forbidden_parents: false,
+            },
+        )
+        .unwrap();
+        let orphan = create_note_with_target(
+            &conn,
+            "into",
+            None,
+            NoteCreateParams {
+                parent_note_id: orphan_parent.note_id.clone(),
                 title: Some("Orphan".to_string()),
                 note_type: None,
                 mime: None,
@@ -4379,7 +4443,8 @@ mod tests {
         )
         .unwrap();
         delete_note(&conn, &orphan.note_id, "dv00000102").unwrap();
-        // First delete the orphan's parent, so no live parent branch exists for it.
+        // Delete the orphan's parent: no live parent branch survives for the note.
+        delete_note(&conn, &orphan_parent.note_id, "dv00000103").unwrap();
         let fallback = create_note_with_target(
             &conn,
             "into",
@@ -4401,8 +4466,6 @@ mod tests {
             },
         )
         .unwrap();
-        delete_note(&conn, &fallback.note_id, "dv00000103").unwrap();
-        delete_note(&conn, &orphan.note_id, "dv00000102").unwrap();
         let result = undelete_note(&conn, &orphan.note_id, Some(&fallback.note_id)).unwrap();
         assert!(result.undeleted, "orphan should be restorable under the fallback parent");
         assert!(result.restored_to_fallback_parent, "the fallback parent reattachment must be reported");
@@ -4585,5 +4648,92 @@ mod tests {
 
         // Deleting a nonexistent attribute is a silent success, like the real route.
         delete_note_attribute(&conn, &note_a, "no-such-attribute").unwrap();
+    }
+
+    /// `BNote.saveRevision` attachment versioning over a copy of a real database: a text
+    /// note with an attachment gets the attachment copied under the revision and its
+    /// content rewritten to point at the copy (own blob); once the attachment is gone a
+    /// fresh snapshot shares the note's blob again, like the plain no-attachment case.
+    #[test]
+    fn revision_snapshots_copy_attachments() {
+        let Ok(src) = std::env::var("TRILIUM_VERIFY_SOURCE") else {
+            eprintln!("TRILIUM_VERIFY_SOURCE not set; integration verification skipped");
+            return;
+        };
+        let conn = copy_db(&src);
+        let note_id = pick_text_note(&conn);
+
+        // A `file` attachment on the note, as an editor would attach one.
+        let attachment_id = {
+            let local = local_now();
+            let utc = utc_now();
+            let blob = hashed_blob_id_bytes(b"0123456789abcdef");
+            insert_blob(&conn, &blob, BlobContent::Bytes(b"0123456789abcdef"), "48,49,50,51,52,53,54,55,56,57,97,98,99,100,101,102", &local, &utc).unwrap();
+            conn.execute(
+                "INSERT INTO attachments (attachmentId, ownerId, role, mime, title, isProtected, \
+                 position, blobId, dateModified, utcDateModified, isDeleted, deleteId) \
+                 VALUES ('rev-test-att', ?1, 'file', 'application/octet-stream', 'data.bin', 0, 10, ?2, ?3, ?4, 0, NULL)",
+                params![note_id, blob, local, utc],
+            )
+            .unwrap();
+            "rev-test-att".to_string()
+        };
+
+        // Point the note's content at the attachment (written directly, so the save-path
+        // link scan doesn't rewrite it before the snapshot runs).
+        let content = format!(
+            r##"<p><img src="api/attachments/{attachment_id}/image/pic.png"> <a href="#root/{note_id}?viewMode=attachments&attachmentId={attachment_id}">ref</a></p>"##
+        );
+        let note = load_note(&conn, &note_id).unwrap().unwrap();
+        let local = local_now();
+        let utc = utc_now();
+        let note_blob = store_entity_content(&conn, note.is_protected, true, content.as_bytes(), &local, &utc).unwrap();
+        conn.execute("UPDATE notes SET blobId = ?1 WHERE noteId = ?2", params![note_blob, note_id]).unwrap();
+
+        // Snapshot: the attachment must be copied under the revision and the content
+        // rewritten to reference the copy, so the revision carries its own blob.
+        let note = load_note(&conn, &note_id).unwrap().unwrap();
+        create_revision(&conn, &note).unwrap();
+        let (revision_id, revision_blob): (String, String) = conn
+            .query_row(
+                "SELECT revisionId, blobId FROM revisions WHERE noteId = ?1 ORDER BY utcDateCreated DESC LIMIT 1",
+                params![note_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(revision_blob, note_blob, "rewritten content must get its own blob");
+        let (rev_att_id, rev_att_blob): (String, String) = conn
+            .query_row("SELECT attachmentId, blobId FROM attachments WHERE ownerId = ?1", params![revision_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_ne!(rev_att_id, attachment_id, "the revision owns a fresh attachment copy");
+        assert_eq!(rev_att_blob.len(), 20, "the copy shares the source blob (hashed id)");
+        let rev_content: String = conn
+            .query_row("SELECT content FROM blobs WHERE blobId = ?1", params![revision_blob], |r| r.get(0))
+            .unwrap();
+        assert!(
+            rev_content.contains(&format!("api/attachments/{rev_att_id}/image/pic.png")),
+            "image URLs are re-pointed at the copy: {rev_content}"
+        );
+        assert!(
+            rev_content.contains(&format!("href=\"api/attachments/{rev_att_id}/download\"")),
+            "reference links collapse to the copy's download: {rev_content}"
+        );
+        assert!(!rev_content.contains(&format!("api/attachments/{attachment_id}/")), "source attachment id must be gone");
+
+        // Without attachments the snapshot shares the note's blob again (no rewrite → no
+        // new blob), as the plain no-attachment save has always done.
+        delete_attachment(&conn, &attachment_id).unwrap();
+        let note = load_note(&conn, &note_id).unwrap().unwrap();
+        create_revision(&conn, &note).unwrap();
+        let second_blob: String = conn
+            .query_row(
+                "SELECT blobId FROM revisions WHERE noteId = ?1 ORDER BY utcDateCreated DESC LIMIT 1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_blob, note.blob_id.unwrap(), "attachment-less snapshot reuses the note's blob");
+
+        eprintln!("revision-attachment verification passed for note {note_id}");
     }
 }
