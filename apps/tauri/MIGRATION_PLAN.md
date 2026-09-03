@@ -174,9 +174,57 @@ DOM 钩子拦不到（非 link/img 元素），需要 await 用户真造一个 `
   （`TRILIUM_VERIFY_SOURCE` 真实库副本插入夹具主题笔记验证字段）。`cargo test` 18 项全绿
   （含对真实 `document.db` 副本跑通的集成项）。
 
-### ⏳ 待办（后续步骤）
+### ✅ notes 写路由基建（本步骤，未提交）
 
-- notes 写路由基建：`createNewNote`（已有内部基建，公开路由未接）、改名、删除/撤销删除。
+对齐 `routes/api/notes.ts` 的创建/改名/删除/撤销删除四组路由，`cargo check` 零警告、
+`cargo test` 20 项全绿（新增 `note_lifecycle_create_rename_delete_undelete_erase`
+真实库副本集成测试）：
+
+- **dispatch（`commands/api.rs`）**：
+
+  - `POST notes/{parentNoteId}/children?target=into|after|before&targetBranchId=…`
+    → `create_note_route`：解析 body 为 `NoteCreateParams`，返回 `{ note, branch }`。
+
+  - `PUT notes/{noteId}/title` → `change_title_route`（`noteService.changeTitle`）。
+
+  - `PUT notes/{noteId}/undelete` → `undelete_note_route`（回 `{ undeleted,
+    restoredToFallbackParent }`，body `fallbackParentNoteId` 可选）。
+
+  - `DELETE notes/{noteId}?taskId&eraseNotes&last` → `delete_note_route`
+    （生成 deleteId、软删、可选立即擦除、`last=true` 时发 WS `taskSucceeded`）。
+
+  - 序列化抽公共 `note_row_value` / `branch_row_value`（完整 pojo，标题按保护会话
+    解密/掩码），`convert-to-note` 响应一并复用。
+
+- **`db/write.rs`**：
+
+  - `create_note_with_target`：父笔记校验（launcher/`_lbRoot`/`_hidden`/`_lbTpl`/
+    `_help`/`_options` 禁建）、type/mime 派生（无 type 继承 code 父类型+mime，否则
+    text/text/html；模板 mime 继承优先于类型默认）、默认标题 "New note"
+    （`titleTemplate` 模板求值未复刻）、`after`/`before` 兄弟位次平移 +
+    `note_reordering` 变更、模板支持（`~template` 关系、二进制模板内容复制、
+    非 image 附件复制）、body `attributes` 原子写入、`child:` 属性复制
+    （父级 `child:template` 被显式模板压制）、创建后内容链接扫描。
+
+  - `create_new_note` 拆出 `create_note_entity`（低频、供 convert 与路由共用）。
+
+  - `change_note_title`：受保护会话门禁、标题变化才记 revision、受保护标题加密落盘。
+
+  - `delete_note` + `delete_branch_recursively`（`BBranch.deleteBranch` 级联：本分支→
+    弱分支→子分支→owned 属性→target 关系→附件→笔记本身，共享同一 deleteId；
+    root/hoisted 拒绝、强父分支存在时仅删分支）。
+
+  - `erase_notes_with_delete_id`（`erase.ts` 镜像：物理删 notes/branches/attributes/
+    attachments + 被删笔记的 revisions，entity\_changes 置 `isErased`，清孤儿 blob）。
+
+  - `undelete_note` + `undelete_branch` + `restore_note_and_descendants`：经存活父分支
+    恢复或经 fallback 父重挂孤儿；仅恢复匹配同一 deleteId 的批次；保存恢复行的
+    原值（仅 `isDeleted` 归零，等价 `entity.save()`）。
+
+未纳入本步：`sort-children`、`duplicate`、`convert-format`、revision 子路由、
+`titleTemplate` 求值、删除前预览（`delete-notes-preview`）。
+
+### ⏳ 待办（后续步骤）
 
 - `saveRevision` 附件版本管理：revision 快照连同附件一起版本化。
 
@@ -194,14 +242,13 @@ DOM 钩子拦不到（非 link/img 元素），需要 await 用户真造一个 `
 未提交改动（不 push，用户确认后才 commit）：
 
 ```
- M apps/tauri/src-tauri/src/commands/api.rs         # get_api_media 命令 + resolve_media_resource 三臂 + 集成测试
- M apps/tauri/src-tauri/src/db/write.rs             # read_clear_bytes 转 pub（媒体读复用）
- M apps/tauri/src-tauri/src/main.rs                 # 注册 get_api_media；JS 媒体拦截（MutationObserver）
+ M apps/tauri/src-tauri/src/commands/api.rs         # notes 四组写路由 dispatch + note/branch pojo 序列化
+ M apps/tauri/src-tauri/src/db/write.rs             # create_note_with_target / change_note_title / delete_note / undelete_note / erase
  M apps/tauri/MIGRATION_PLAN.md
 ```
 
 已提交：`93884c5e9e`（受保护笔记）、`1f6c330c24`（multipart+convert）、`cba58ecaac`、`b88c672df8`、
-`f3a1548961`（options/user-themes）、`f9c3e5731b`（Boxicons 图标包）、`471d7296d9`（.gitattributes LF 修复）等。
+`f3a1548961`（options/user-themes）、`f9c3e5731b`（Boxicons 图标包）、`4dac3a65e9`（附件图片媒体路由）、`471d7296d9`（.gitattributes LF 修复）等。
 
 ## 约定
 

@@ -82,12 +82,15 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
     };
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-    // The write path so far is a single route: editing a note's data.
+    // The write path is mirroring the note/attachment/option routes of the internal
+    // REST API; every arm below mutates the database and records entity changes.
     if method == "PUT" {
         return match segments.as_slice() {
             ["notes", note_id, "protect", protect] => protect_note(conn, app, note_id, protect, query),
             ["notes", note_id, "data"] => put_note_data(conn, note_id, data),
             ["notes", note_id, "file"] => update_file_route(conn, note_id, query, data),
+            ["notes", note_id, "title"] => change_title_route(conn, note_id, data),
+            ["notes", note_id, "undelete"] => undelete_note_route(conn, note_id, data),
             ["attachments", attachment_id, "rename"] => rename_attachment_route(conn, attachment_id, data),
             ["attachments", attachment_id, "file"] => update_attachment_file_route(conn, attachment_id, data),
             ["images", note_id] => update_image_route(conn, note_id, data),
@@ -106,12 +109,15 @@ fn dispatch(conn: &rusqlite::Connection, app: &AppHandle, method: &str, url: &st
                 })?;
                 Ok(json!({}))
             }
+            ["notes", note_id] => delete_note_route(conn, app, note_id, query),
             _ => Err(not_found(&format!("No route for DELETE {url}"))),
         };
     }
 
     if method == "POST" {
         return match segments.as_slice() {
+            // A brand-new note under `parentNoteId`, placed by `?target` (into/after/before).
+            ["notes", parent_note_id, "children"] => create_note_route(conn, parent_note_id, data, query),
             // froca.reloadNotes preloads an explicit set of notes before restoring
             // tabs; answering it is what lets an opened note actually render.
             ["tree", "load"] => load_note_subtree(conn, data),
@@ -785,25 +791,184 @@ fn convert_attachment_to_note_route(conn: &rusqlite::Connection, attachment_id: 
         message: err.message,
     })?;
 
-    let note = db::get_note(conn, &created.note_id).ok_or_else(|| not_found(&format!("Note '{}' not found", created.note_id)))?;
-    Ok(json!({
-        "note": {
-            "noteId": note.note_id,
-            "title": session::title_or_mask(note.is_protected, note.title),
-            "isProtected": note.is_protected,
-            "type": note.note_type,
-            "mime": note.mime,
-            "blobId": note.blob_id,
-        },
-        "branch": {
-            "branchId": created.branch_id,
-            "noteId": created.note_id,
-            "parentNoteId": created.parent_note_id,
-            "notePosition": created.note_position,
-            "prefix": "",
-            "isExpanded": false,
-        }
+    let note = note_row_value(conn, &created.note_id).ok_or_else(|| not_found(&format!("Note '{}' not found", created.note_id)))?;
+    let branch = branch_row_value(conn, &created.branch_id).ok_or_else(|| not_found(&format!("Branch '{}' not found", created.branch_id)))?;
+    Ok(json!({ "note": note, "branch": branch }))
+}
+
+// ---------------------------------------------------------------------------
+// Note lifecycle routes — create / rename / delete / undelete. These are the
+// `notesApiRoute` handlers; the schema mutation lives in `db::write`.
+// ---------------------------------------------------------------------------
+
+/// A freshly written note as the client's `FNote` pojo: title decrypted or masked per
+/// the protected-session state (like the tree payload), plus the stored timestamps.
+fn note_row_value(conn: &rusqlite::Connection, note_id: &str) -> Option<Value> {
+    let note = db::get_note(conn, note_id)?;
+    let meta = db::get_note_metadata(conn, note_id);
+    Some(json!({
+        "noteId": note.note_id,
+        "title": session::title_or_mask(note.is_protected, note.title),
+        "isProtected": note.is_protected,
+        "type": note.note_type,
+        "mime": note.mime,
+        "blobId": note.blob_id,
+        "isDeleted": false,
+        "dateCreated": meta.as_ref().map(|m| m.date_created.clone()),
+        "dateModified": meta.as_ref().map(|m| m.date_modified.clone()),
+        "utcDateCreated": meta.as_ref().map(|m| m.utc_date_created.clone()),
+        "utcDateModified": meta.as_ref().map(|m| m.utc_date_modified.clone()),
     }))
+}
+
+/// A branch as the client's `FBranch` pojo, for the create/convert responses.
+fn branch_row_value(conn: &rusqlite::Connection, branch_id: &str) -> Option<Value> {
+    conn.query_row(
+        "SELECT branchId, noteId, parentNoteId, prefix, notePosition, isExpanded, utcDateModified \
+         FROM branches WHERE branchId = ?1",
+        [branch_id],
+        |row| {
+            Ok(json!({
+                "branchId": row.get::<_, String>(0)?,
+                "noteId": row.get::<_, String>(1)?,
+                "parentNoteId": row.get::<_, String>(2)?,
+                "prefix": row.get::<_, Option<String>>(3)?,
+                "notePosition": row.get::<_, i64>(4)?,
+                "isExpanded": row.get::<_, i64>(5)? != 0,
+                "isDeleted": false,
+                "utcDateModified": row.get::<_, String>(6)?,
+            }))
+        },
+    )
+    .ok()
+}
+
+/// `POST /notes/{parentNoteId}/children` — `notesApiRoute.createNote` with
+/// `?target=into|after|before` (and `targetBranchId` for after/before). The body is
+/// `NoteParams` minus `parentNoteId` (it comes from the path); the response is the
+/// `{ note, branch }` pair the client activates.
+fn create_note_route(conn: &rusqlite::Connection, parent_note_id: &str, data: &Option<Value>, query: &str) -> Result<Value, ApiError> {
+    let target = parse_param(query, "target").unwrap_or("into");
+    let target_branch_id = parse_param(query, "targetBranchId").filter(|id| !id.is_empty());
+    if !["into", "after", "before"].contains(&target) {
+        return Err(bad_request("Invalid target type."));
+    }
+    if target != "into" && target_branch_id.is_none() {
+        return Err(bad_request("Missing or incorrect type for target branch ID."));
+    }
+    let Some(payload) = data else {
+        return Err(bad_request("Missing payload for notes/{parentNoteId}/children"));
+    };
+
+    let params = db::write::NoteCreateParams {
+        parent_note_id: parent_note_id.to_string(),
+        title: payload.get("title").and_then(Value::as_str).map(str::to_string),
+        note_type: payload.get("type").and_then(Value::as_str).map(str::to_string),
+        mime: payload.get("mime").and_then(Value::as_str).map(str::to_string),
+        content: payload.get("content").and_then(Value::as_str).unwrap_or("").to_string(),
+        is_protected: payload.get("isProtected").and_then(Value::as_bool).unwrap_or(false),
+        is_expanded: payload.get("isExpanded").and_then(Value::as_bool).unwrap_or(false),
+        prefix: payload.get("prefix").and_then(Value::as_str).map(str::to_string),
+        note_position: payload.get("notePosition").and_then(Value::as_i64),
+        note_id: payload.get("noteId").and_then(Value::as_str).map(str::to_string),
+        template_note_id: payload.get("templateNoteId").and_then(Value::as_str).map(str::to_string),
+        attributes: payload
+            .get("attributes")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        Some(db::write::CreateAttribute {
+                            attr_type: item.get("type")?.as_str()?.to_string(),
+                            name: item.get("name")?.as_str()?.to_string(),
+                            value: item.get("value").and_then(Value::as_str).unwrap_or("").to_string(),
+                            is_inheritable: item.get("isInheritable").and_then(Value::as_bool).unwrap_or(false),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ignore_forbidden_parents: payload.get("ignoreForbiddenParents").and_then(Value::as_bool).unwrap_or(false),
+    };
+
+    let created = db::write::create_note_with_target(conn, target, target_branch_id, params).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+
+    let note = note_row_value(conn, &created.note_id).ok_or_else(|| not_found(&format!("Note '{}' not found", created.note_id)))?;
+    let branch = branch_row_value(conn, &created.branch_id).ok_or_else(|| not_found(&format!("Branch '{}' not found", created.branch_id)))?;
+    Ok(json!({ "note": note, "branch": branch }))
+}
+
+/// `PUT /notes/{noteId}/title` — `notesApiRoute.changeTitle`: returns the saved note.
+fn change_title_route(conn: &rusqlite::Connection, note_id: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+    let Some(title) = data.as_ref().and_then(|v| v.get("title")).and_then(Value::as_str) else {
+        return Err(bad_request("Invalid 'title'."));
+    };
+
+    db::write::change_note_title(conn, note_id, title).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+    note_row_value(conn, note_id).ok_or_else(|| not_found(&format!("Note '{}' not found", note_id)))
+}
+
+/// `PUT /notes/{noteId}/undelete` — `notesApiRoute.undeleteNote` with the optional
+/// `{ fallbackParentNoteId }` body. Answers `{ undeleted, restoredToFallbackParent }`.
+fn undelete_note_route(conn: &rusqlite::Connection, note_id: &str, data: &Option<Value>) -> Result<Value, ApiError> {
+    let fallback_present = data.as_ref().and_then(|v| v.get("fallbackParentNoteId")).is_some();
+    let fallback = data.as_ref().and_then(|v| v.get("fallbackParentNoteId")).and_then(Value::as_str);
+    if fallback_present && fallback.is_none() {
+        return Err(bad_request("'fallbackParentNoteId' must be a note id."));
+    }
+
+    let result = db::write::undelete_note(conn, note_id, fallback).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+    Ok(json!({
+        "undeleted": result.undeleted,
+        "restoredToFallbackParent": result.restored_to_fallback_parent,
+    }))
+}
+
+/// `DELETE /notes/{noteId}` — `notesApiRoute.deleteNote`: soft-delete (optionally erase
+/// immediately) under a fresh `deleteId`, and report the task succeeded on the `last`
+/// request of the batch, like the real task context does over the websocket.
+fn delete_note_route(conn: &rusqlite::Connection, app: &AppHandle, note_id: &str, query: &str) -> Result<Value, ApiError> {
+    let task_id = parse_param(query, "taskId").unwrap_or_default();
+    if task_id.is_empty() {
+        return Err(bad_request("Missing or incorrect type for task ID."));
+    }
+    let erase_notes = parse_param(query, "eraseNotes").map(|v| v == "true").unwrap_or(false);
+    let last = parse_param(query, "last").map(|v| v == "true").unwrap_or(false);
+
+    let delete_id = db::write::random_string(10);
+    db::write::delete_note(conn, note_id, &delete_id).map_err(|err| ApiError {
+        status: err.status,
+        message: err.message,
+    })?;
+    if erase_notes {
+        db::write::erase_notes_with_delete_id(conn, &delete_id).map_err(|err| ApiError {
+            status: 500,
+            message: format!("failed to erase notes: {err}"),
+        })?;
+    }
+    if last {
+        messages::emit_to_frontend(
+            app,
+            json!({
+                "type": "taskSucceeded",
+                "taskId": task_id,
+                "taskType": "deleteNotes",
+                "data": null,
+                "result": null,
+            }),
+        );
+    }
+    Ok(json!({}))
 }
 
 /// `GET /attachments/{id}/image-info` — the shape the image-compression dialog

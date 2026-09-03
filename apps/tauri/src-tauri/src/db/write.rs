@@ -2153,8 +2153,6 @@ pub fn update_image_note(conn: &Connection, note_id: &str, original_name: &str, 
 pub struct NewNote {
     pub note_id: String,
     pub branch_id: String,
-    pub parent_note_id: String,
-    pub note_position: i64,
 }
 
 /// `getNewNotePosition` + `BBranch.beforeSaving`: one step below the deepest child,
@@ -2211,6 +2209,21 @@ fn copy_child_attributes(conn: &Connection, parent_note_id: &str, child_note_id:
     for (attr_type, name, value, position, is_inheritable) in rows {
         let stripped = name.strip_prefix("child:").unwrap_or(&name).to_string();
         if attr_type == "relation" && stripped == "template" {
+            // A template the user chose explicitly at creation (an owned `~template`
+            // relation, added before this runs) suppresses the parent's `child:template`
+            // default; only the default path applies the type-match filter below.
+            let owned_template: bool = conn
+                .query_row(
+                    "SELECT 1 FROM attributes WHERE noteId = ?1 AND type = 'relation' AND name = 'template' AND isDeleted = 0 LIMIT 1",
+                    params![child_note_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0)
+                == 1;
+            if owned_template {
+                continue;
+            }
             let template_type: Option<String> = conn
                 .query_row("SELECT type FROM notes WHERE noteId = ?1 AND isDeleted = 0", params![value], |row| row.get(0))
                 .optional()?;
@@ -2246,7 +2259,31 @@ pub fn create_new_note(
     is_protected: bool,
     content: &[u8],
 ) -> rusqlite::Result<NewNote> {
-    let note_id = random_string(12);
+    let created = create_note_entity(conn, parent_note_id, title, note_type, mime, is_protected, content, None, None, false, None)?;
+    copy_child_attributes(conn, parent_note_id, &created.note_id)?;
+    Ok(created)
+}
+
+/// The low-level create used by both `create_new_note` (convert-to-note) and the public
+/// create route: notes row + blob + branch, each with its entity change, honoring the
+/// optional overrides the route passes through (`notePosition`, forced `noteId`,
+/// `isExpanded`, `prefix`). `copy_child_attributes` is the caller's job so a template
+/// relation can be recorded before the `child:` attributes are copied.
+#[allow(clippy::too_many_arguments)]
+fn create_note_entity(
+    conn: &Connection,
+    parent_note_id: &str,
+    title: &str,
+    note_type: &str,
+    mime: &str,
+    is_protected: bool,
+    content: &[u8],
+    note_position: Option<i64>,
+    note_id: Option<&str>,
+    is_expanded: bool,
+    prefix: Option<&str>,
+) -> rusqlite::Result<NewNote> {
+    let note_id = note_id.map(str::to_string).unwrap_or_else(|| random_string(12));
     let branch_id = format!("{parent_note_id}_{note_id}");
     let local = local_now();
     let utc = utc_now();
@@ -2259,7 +2296,7 @@ pub fn create_new_note(
     };
     let is_string = is_string_note(note_type, mime);
     let blob_id = store_entity_content(conn, is_protected, is_string, content, &local, &utc)?;
-    let note_position = note_position_for(conn, parent_note_id)?;
+    let note_position = note_position.unwrap_or(note_position_for(conn, parent_note_id)?);
 
     conn.execute(
         "INSERT INTO notes (noteId, title, isProtected, type, mime, blobId, isDeleted, deleteId, \
@@ -2293,15 +2330,13 @@ pub fn create_new_note(
 
     conn.execute(
         "INSERT INTO branches (branchId, noteId, parentNoteId, notePosition, prefix, isExpanded, isDeleted, deleteId, utcDateModified) \
-         VALUES (?1, ?2, ?3, ?4, '', 0, 0, NULL, ?5)",
-        params![branch_id, note_id, parent_note_id, note_position, utc],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7)",
+        params![branch_id, note_id, parent_note_id, note_position, prefix.unwrap_or(""), i64::from(is_expanded), utc],
     )?;
-    let branch_input = format!("|{branch_id}|{note_id}|{parent_note_id}|");
+    let branch_input = format!("|{branch_id}|{note_id}|{parent_note_id}|{}", prefix.unwrap_or(""));
     put_entity_change(conn, "branches", &branch_id, &hash10(&branch_input), &utc)?;
 
-    copy_child_attributes(conn, parent_note_id, &note.note_id)?;
-
-    Ok(NewNote { note_id, branch_id, parent_note_id: parent_note_id.to_string(), note_position })
+    Ok(NewNote { note_id, branch_id })
 }
 
 /// `BAttachment.convertToNote`: lift the attachment into a note of its own under the
@@ -2416,6 +2451,857 @@ pub fn convert_attachment_to_note(conn: &Connection, attachment_id: &str) -> Res
             Err(WriteError::from(err))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Note lifecycle writes — the `notes` create / rename / delete / undelete routes.
+// Mirrors `noteService.createNewNote[WithTarget]` and `changeTitle`, `BNote.deleteNote`
+// (+ `BBranch.deleteBranch` cascade) and the undelete walk in `services/notes.ts`.
+// ---------------------------------------------------------------------------
+
+/// One attribute to be set on a newly created note, atomically with the note itself
+/// (`NoteParams.attributes`); `attr_type` is `label` or `relation`.
+pub struct CreateAttribute {
+    pub attr_type: String,
+    pub name: String,
+    pub value: String,
+    pub is_inheritable: bool,
+}
+
+/// `NoteParams` of the public create route. Every `Option` falls back to the same
+/// default `noteService.createNewNote` applies: the title to the app default, the
+/// type/mime derived from the parent and the per-type default-mime table, the position
+/// after the deepest sibling.
+pub struct NoteCreateParams {
+    pub parent_note_id: String,
+    pub title: Option<String>,
+    pub note_type: Option<String>,
+    pub mime: Option<String>,
+    pub content: String,
+    pub is_protected: bool,
+    pub is_expanded: bool,
+    pub prefix: Option<String>,
+    pub note_position: Option<i64>,
+    pub note_id: Option<String>,
+    pub template_note_id: Option<String>,
+    pub attributes: Vec<CreateAttribute>,
+    pub ignore_forbidden_parents: bool,
+}
+
+/// `deriveMime`: the default MIME per note type when none was given.
+fn default_mime_for(note_type: &str) -> String {
+    match note_type {
+        "text" => "text/html",
+        "code" => "text/plain",
+        "file" => "application/octet-stream",
+        "relationMap" | "canvas" | "mindMap" | "spreadsheet" | "llmChat" => "application/json",
+        "mermaid" => "text/vnd.mermaid",
+        // render/image/search/book/noteMap/webView/launcher/doc/contentWidget have no default
+        _ => "",
+    }
+    .to_string()
+}
+
+/// `getAndValidateParent`: the parent must exist, not be a launcher (other than the
+/// bookmarks bar) and — unless `ignoreForbiddenParents` — not be a structural root.
+fn validate_parent_for_child(parent: &WriteNote, ignore_forbidden: bool) -> Result<(), WriteError> {
+    if parent.note_type == "launcher" && parent.note_id != "_lbBookmarks" {
+        return Err(WriteError {
+            status: 400,
+            message: "Creating child notes into launcher notes is not allowed.".to_string(),
+        });
+    }
+    if ignore_forbidden {
+        return Ok(());
+    }
+    let forbidden = parent.note_id == "_lbRoot"
+        || parent.note_id == "_hidden"
+        || parent.note_id.starts_with("_lbTpl")
+        || parent.note_id.starts_with("_help")
+        || parent.note_id.starts_with("_options"); // isOptions()
+    if forbidden {
+        return Err(WriteError {
+            status: 400,
+            message: format!("Creating child notes into '{}' is not allowed.", parent.note_id),
+        });
+    }
+    Ok(())
+}
+
+/// Where the new branch lands: at the tail (`into`), or right after/before a sibling
+/// branch (`after`/`before`), which also shifts the sibling positions.
+enum PositionPlan {
+    Tail,
+    After(String),
+    Before(String),
+}
+
+/// `createNewNoteWithTarget` + the `createNewNote` orchestration for the shell: parent
+/// validation, type/mime derivation, default title, optional template support (mime
+/// inheritance, binary content copy, `~template` relation, attachment copies), atomic
+/// body attributes and `child:`-prefixed copies. Owns its transaction.
+pub fn create_note_with_target(
+    conn: &Connection,
+    target: &str,
+    target_branch_id: Option<&str>,
+    params: NoteCreateParams,
+) -> Result<NewNote, WriteError> {
+    let plan = match target {
+        "into" => PositionPlan::Tail,
+        "after" => PositionPlan::After(target_branch_id.unwrap_or("").to_string()),
+        "before" => PositionPlan::Before(target_branch_id.unwrap_or("").to_string()),
+        _ => {
+            return Err(WriteError {
+                status: 400,
+                message: "Invalid target type.".to_string(),
+            });
+        }
+    };
+
+    let parent = load_note(conn, &params.parent_note_id)
+        .map_err(WriteError::from)?
+        .ok_or_else(|| WriteError {
+            status: 400,
+            message: format!("Parent note '{}' was not found.", params.parent_note_id),
+        })?;
+    validate_parent_for_child(&parent, params.ignore_forbidden_parents)?;
+
+    // Type defaults mirror `createNewNoteWithTarget`: no explicit type inherits a `code`
+    // parent's type (and mime), and everything else becomes `text`/`text/html`.
+    let is_type_defaulted = params.note_type.is_none();
+    let note_type = params
+        .note_type
+        .clone()
+        .unwrap_or_else(|| if parent.note_type == "code" { "code".to_string() } else { "text".to_string() });
+    let defaulted_mime = if is_type_defaulted {
+        Some(if parent.note_type == "code" { parent.mime.clone() } else { "text/html".to_string() })
+    } else {
+        None
+    };
+
+    // Template: existence check is deferred to inside the transaction; its mime only
+    // inherits when neither the payload nor the type-defaulting supplied one.
+    if let Some(template_id) = &params.template_note_id {
+        let template = load_note(conn, template_id).map_err(WriteError::from)?;
+        if template.is_none() {
+            return Err(WriteError {
+                status: 400,
+                message: format!("Template note '{template_id}' does not exist."),
+            });
+        }
+    }
+
+    let template_note = params
+        .template_note_id
+        .as_deref()
+        .and_then(|id| load_note(conn, id).ok().flatten());
+    let mime = params
+        .mime
+        .clone()
+        .or(defaulted_mime)
+        .or_else(|| template_note.as_ref().map(|t| t.mime.clone()))
+        .unwrap_or_else(|| default_mime_for(&note_type));
+
+    // `getNewNoteTitle`: the app default for "new note". The real titleTemplate
+    // evaluation on the parent is not reproduced in this shell.
+    let title = params.title.clone().unwrap_or_else(|| "New note".to_string());
+
+    let content = params.content.clone();
+    let template = template_note;
+
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> rusqlite::Result<NewNote> {
+        // Position plan: `after`/`before` shift the sibling positions and record a
+        // note-reordering change for the parent (positions are not part of branch hashes).
+        let (note_position, reorder) = match &plan {
+            PositionPlan::Tail => (params.note_position, false),
+            PositionPlan::After(target_branch_id) => {
+                let after_pos: i64 = conn
+                    .query_row(
+                        "SELECT notePosition FROM branches WHERE branchId = ?1 AND parentNoteId = ?2 AND isDeleted = 0",
+                        params![target_branch_id, params.parent_note_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+                conn.execute(
+                    "UPDATE branches SET notePosition = notePosition + 10 \
+                     WHERE parentNoteId = ?1 AND notePosition > ?2 AND isDeleted = 0",
+                    params![params.parent_note_id, after_pos],
+                )?;
+                (Some(after_pos + 10), true)
+            }
+            PositionPlan::Before(target_branch_id) => {
+                let before_pos: i64 = conn
+                    .query_row(
+                        "SELECT notePosition FROM branches WHERE branchId = ?1 AND parentNoteId = ?2 AND isDeleted = 0",
+                        params![target_branch_id, params.parent_note_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+                conn.execute(
+                    "UPDATE branches SET notePosition = notePosition - 10 \
+                     WHERE parentNoteId = ?1 AND notePosition < ?2 AND isDeleted = 0",
+                    params![params.parent_note_id, before_pos],
+                )?;
+                (Some(before_pos - 10), true)
+            }
+        };
+
+        let created = create_note_entity(
+            conn,
+            &params.parent_note_id,
+            &title,
+            &note_type,
+            &mime,
+            params.is_protected,
+            content.as_bytes(),
+            note_position,
+            params.note_id.as_deref(),
+            params.is_expanded,
+            params.prefix.as_deref(),
+        )?;
+        if reorder {
+            put_entity_change(conn, "note_reordering", &params.parent_note_id, "N/A", &utc_now())?;
+        }
+
+        // A binary-type template fills the new note with its content (string templates
+        // leave the sent `content` in place — the note already holds it).
+        if let Some(template) = &template {
+            if !is_string_note(&template.note_type, &template.mime) {
+                let old_blob = created_note_blob(conn, &created.note_id)?;
+                let bytes = match &template.blob_id {
+                    Some(blob_id) => read_clear_bytes(conn, blob_id, template.is_protected)?,
+                    None => Vec::new(),
+                };
+                let local = local_now();
+                let utc = utc_now();
+                let new_blob = store_entity_content(conn, params.is_protected, false, &bytes, &local, &utc)?;
+                if old_blob.as_ref() != Some(&new_blob) {
+                    conn.execute(
+                        "UPDATE notes SET blobId = ?1, dateModified = ?2, utcDateModified = ?3 WHERE noteId = ?4",
+                        params![new_blob, local, utc, created.note_id],
+                    )?;
+                    let mut note = load_note(conn, &created.note_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+                    note.blob_id = Some(new_blob);
+                    put_entity_change(conn, "notes", &created.note_id, &note_hash(&note, false), &utc)?;
+                    if let Some(old) = old_blob {
+                        delete_blob_if_not_used(conn, &old)?;
+                    }
+                }
+            }
+
+            // The `~template` relation is recorded before `copy_child_attributes` runs, so a
+            // parent's `child:template` default is suppressed by this explicit choice.
+            insert_attribute(conn, &created.note_id, "relation", "template", &template.note_id)?;
+
+            // Non-image attachments of the template are copied over (`copyAttachments`;
+            // image roles are handled by the later link scan in `check_image_attachments`).
+            let mut stmt = conn.prepare(
+                "SELECT attachmentId, role, mime, title, COALESCE(blobId, ''), isProtected \
+                 FROM attachments WHERE ownerId = ?1 AND isDeleted = 0 AND role != 'image'",
+            )?;
+            let copies: Vec<(String, String, String, String, String, i64)> = stmt
+                .query_map(params![template.note_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (_attachment_id, role, mime, title, blob_id, is_protected) in copies {
+                copy_attachment(conn, &created.note_id, &role, &mime, &title, &blob_id, is_protected != 0)?;
+            }
+        }
+
+        // Body attributes are written atomically with the note.
+        for attribute in &params.attributes {
+            let attribute_id = random_string(12);
+            let utc = utc_now();
+            let max_position: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(position), 0) FROM attributes WHERE noteId = ?1 AND isDeleted = 0",
+                params![created.note_id],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "INSERT INTO attributes (attributeId, noteId, type, name, value, position, utcDateModified, isDeleted, deleteId, isInheritable) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)",
+                params![attribute_id, created.note_id, attribute.attr_type, attribute.name, attribute.value, max_position + 10, utc, attribute.is_inheritable],
+            )?;
+            let hash = attribute_hash(&attribute_id, &created.note_id, &attribute.attr_type, &attribute.name, &attribute.value, attribute.is_inheritable, false);
+            put_entity_change(conn, "attributes", &attribute_id, &hash, &utc)?;
+        }
+
+        copy_child_attributes(conn, &params.parent_note_id, &created.note_id)?;
+
+        // The same link scan a save performs, on the content handed in at creation.
+        if is_type_defaulted && !content.is_empty() {
+            if let Ok(saved) = load_note(conn, &created.note_id) {
+                if let Some(saved) = saved {
+                    let _ = post_process_links(conn, &saved, &content);
+                }
+            }
+        }
+        Ok(created)
+    })();
+    match run {
+        Ok(created) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(created)
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError {
+                status: 400,
+                message: "Missing or incorrect type for target branch ID.".to_string(),
+            })
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::from(err))
+        }
+    }
+}
+
+/// The blob a note currently points at, for the template content-copy overwrite.
+fn created_note_blob(conn: &Connection, note_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT blobId FROM notes WHERE noteId = ?1", params![note_id], |row| row.get(0)).optional()
+}
+
+/// `PUT /notes/{id}/title` — `notesApiRoute.changeTitle`: snapshot the note when the
+/// title actually changes, then store the new title (encrypted at rest for protected
+/// notes) with a fresh entity change. Protected notes require the open session.
+pub fn change_note_title(conn: &Connection, note_id: &str, title: &str) -> Result<(), WriteError> {
+    let note = load_note(conn, note_id).map_err(WriteError::from)?.ok_or_else(|| WriteError::not_found(note_id))?;
+    if note.is_protected && !session::is_available() {
+        return Err(WriteError {
+            status: 400,
+            message: format!("Note '{note_id}' is not available for change"),
+        });
+    }
+    // The stored title of a protected note is ciphertext; compare against the decrypted
+    // form so an untouched save does not take a spurious revision.
+    let current_title = if note.is_protected {
+        session::decrypt_bytes(&note.title)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|| note.title.clone())
+    } else {
+        note.title.clone()
+    };
+    if current_title != title {
+        save_revision_if_needed(conn, &note).map_err(WriteError::from)?;
+    }
+
+    let mut note = note;
+    note.title = if note.is_protected {
+        session::encrypt_string(title).ok_or_else(|| WriteError {
+            status: 500,
+            message: "Failed to encrypt the note title".to_string(),
+        })?
+    } else {
+        title.to_string()
+    };
+    save_note(conn, &note).map_err(WriteError::from)?;
+    Ok(())
+}
+
+/// A `notes` row regardless of deletion state — the delete/undelete paths read and
+/// rewrite soft-deleted rows, which `load_note` filters out.
+struct NoteRowAny {
+    note: WriteNote,
+    is_deleted: bool,
+    delete_id: Option<String>,
+}
+
+fn load_note_any(conn: &Connection, note_id: &str) -> rusqlite::Result<Option<NoteRowAny>> {
+    conn.query_row(
+        "SELECT noteId, title, isProtected, type, mime, blobId, dateModified, utcDateCreated, \
+                utcDateModified, isDeleted, deleteId \
+         FROM notes WHERE noteId = ?1",
+        params![note_id],
+        |row| {
+            Ok(NoteRowAny {
+                note: WriteNote {
+                    note_id: row.get(0)?,
+                    title: row.get(1)?,
+                    note_type: row.get(3)?,
+                    mime: row.get(4)?,
+                    is_protected: row.get::<_, i64>(2)? != 0,
+                    blob_id: row.get(5)?,
+                    date_modified: row.get(6)?,
+                    utc_date_created: row.get(7)?,
+                    utc_date_modified: row.get(8)?,
+                },
+                is_deleted: row.get::<_, i64>(9)? != 0,
+                delete_id: row.get(10)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// A `branches` row regardless of deletion state — only the fields the delete/undelete
+/// cascade reads, not the tree-rendering ones.
+struct BranchState {
+    branch_id: String,
+    note_id: String,
+    parent_note_id: String,
+    prefix: Option<String>,
+    is_deleted: bool,
+}
+
+fn branch_from_row(row: &rusqlite::Row) -> rusqlite::Result<BranchState> {
+    Ok(BranchState {
+        branch_id: row.get(0)?,
+        note_id: row.get(1)?,
+        parent_note_id: row.get(2)?,
+        prefix: row.get(3)?,
+        is_deleted: row.get::<_, i64>(4)? != 0,
+    })
+}
+
+fn load_branch(conn: &Connection, branch_id: &str) -> rusqlite::Result<Option<BranchState>> {
+    conn.query_row(
+        "SELECT branchId, noteId, parentNoteId, prefix, isDeleted FROM branches WHERE branchId = ?1",
+        params![branch_id],
+        branch_from_row,
+    )
+    .optional()
+}
+
+/// The `branches` entity hash over `branchId|noteId|parentNoteId|prefix` — notePosition
+/// deliberately excluded — with the `|deleted` suffix for the soft-delete state.
+fn branch_hash_value(branch_id: &str, note_id: &str, parent_note_id: &str, prefix: Option<&str>, is_deleted: bool) -> String {
+    let mut input = format!("|{branch_id}|{note_id}|{parent_note_id}|{}", prefix.unwrap_or(""));
+    if is_deleted {
+        input.push_str("|deleted");
+    }
+    hash10(&input)
+}
+
+/// `markAsDeleted` for a branch: soft-delete row + deleted entity change.
+fn mark_branch_deleted(conn: &Connection, branch: &BranchState, delete_id: &str) -> rusqlite::Result<()> {
+    let utc = utc_now();
+    conn.execute(
+        "UPDATE branches SET isDeleted = 1, deleteId = ?1, utcDateModified = ?2 WHERE branchId = ?3",
+        params![delete_id, utc, branch.branch_id],
+    )?;
+    put_entity_change(conn, "branches", &branch.branch_id, &branch_hash_value(&branch.branch_id, &branch.note_id, &branch.parent_note_id, branch.prefix.as_deref(), true), &utc)
+}
+
+/// `markAsDeleted` for an attribute (owned labels and target relations alike).
+fn mark_attribute_deleted(
+    conn: &Connection,
+    attribute_id: &str,
+    note_id: &str,
+    attr_type: &str,
+    name: &str,
+    value: &str,
+    is_inheritable: bool,
+    delete_id: &str,
+) -> rusqlite::Result<()> {
+    let utc = utc_now();
+    conn.execute(
+        "UPDATE attributes SET isDeleted = 1, deleteId = ?1, utcDateModified = ?2 WHERE attributeId = ?3",
+        params![delete_id, utc, attribute_id],
+    )?;
+    let hash = attribute_hash(attribute_id, note_id, attr_type, name, value, is_inheritable, true);
+    put_entity_change(conn, "attributes", attribute_id, &hash, &utc)
+}
+
+/// `markAsDeleted` for an attachment.
+fn mark_attachment_deleted(
+    conn: &Connection,
+    attachment_id: &str,
+    owner_id: &str,
+    role: &str,
+    mime: &str,
+    title: &str,
+    blob_id: &str,
+    scheduled: Option<&str>,
+    delete_id: &str,
+) -> rusqlite::Result<()> {
+    let utc = utc_now();
+    conn.execute(
+        "UPDATE attachments SET isDeleted = 1, deleteId = ?1, utcDateModified = ?2 WHERE attachmentId = ?3",
+        params![delete_id, utc, attachment_id],
+    )?;
+    let hash = attachment_hash_value(attachment_id, owner_id, role, mime, title, blob_id, scheduled, true);
+    put_entity_change(conn, "attachments", attachment_id, &hash, &utc)
+}
+
+/// `markAsDeleted` for the note itself.
+fn mark_note_deleted(conn: &Connection, note: &WriteNote, delete_id: &str) -> rusqlite::Result<()> {
+    let local = local_now();
+    let utc = utc_now();
+    conn.execute(
+        "UPDATE notes SET isDeleted = 1, deleteId = ?1, dateModified = ?2, utcDateModified = ?3 WHERE noteId = ?4",
+        params![delete_id, local, utc, note.note_id],
+    )?;
+    put_entity_change(conn, "notes", &note.note_id, &note_hash(note, true), &utc)
+}
+
+/// `BBranch.deleteBranch`: mark the branch deleted; once the note keeps no strong parent,
+/// cascade the same `deleteId` over its weak branches, child branches, owned attributes,
+/// target relations, attachments and finally the note itself. Returns whether the note
+/// (and its subtree) went along with the branch.
+fn delete_branch_recursively(conn: &Connection, branch: &BranchState, delete_id: &str) -> rusqlite::Result<bool> {
+    let is_weak = branch.parent_note_id == "_share" || branch.parent_note_id == "_lbBookmarks";
+    if branch.note_id == "root" && !is_weak {
+        return Err(rusqlite::Error::InvalidQuery); // "Can't delete root or hoisted branch/note"
+    }
+
+    mark_branch_deleted(conn, branch, delete_id)?;
+
+    // The note keeps another strong parent → this was a clone deletion, the note survives.
+    let strong_parents: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM branches WHERE noteId = ?1 AND isDeleted = 0 \
+         AND parentNoteId NOT IN ('_share', '_lbBookmarks')",
+        params![branch.note_id],
+        |row| row.get(0),
+    )?;
+    if strong_parents != 0 {
+        return Ok(false);
+    }
+
+    // Weak parents (shares, bookmarks) follow the note into deletion.
+    let mut stmt = conn.prepare(
+        "SELECT branchId, noteId, parentNoteId, prefix, isDeleted \
+         FROM branches WHERE noteId = ?1 AND isDeleted = 0",
+    )?;
+    let weak_parents: Vec<BranchState> = stmt
+        .query_map(params![branch.note_id], branch_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    for weak in weak_parents {
+        mark_branch_deleted(conn, &weak, delete_id)?;
+    }
+
+    // Children first, then the parent — the deletion shows up in recent changes in that order.
+    let mut stmt = conn.prepare(
+        "SELECT branchId, noteId, parentNoteId, prefix, isDeleted \
+         FROM branches WHERE parentNoteId = ?1 AND isDeleted = 0",
+    )?;
+    let child_branches: Vec<BranchState> = stmt
+        .query_map(params![branch.note_id], branch_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    for child in child_branches {
+        delete_branch_recursively(conn, &child, delete_id)?;
+    }
+
+    // Owned attributes and relations pointing at this note.
+    let mut stmt = conn.prepare(
+        "SELECT attributeId, noteId, type, name, value, isInheritable FROM attributes \
+         WHERE (noteId = ?1 OR (type = 'relation' AND value = ?1)) AND isDeleted = 0",
+    )?;
+    let attrs: Vec<(String, String, String, String, String, i64)> = stmt
+        .query_map(params![branch.note_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (attribute_id, note_id, attr_type, name, value, is_inheritable) in attrs {
+        mark_attribute_deleted(conn, &attribute_id, &note_id, &attr_type, &name, &value, is_inheritable != 0, delete_id)?;
+    }
+
+    // Attachments owned by the note.
+    let mut stmt = conn.prepare(
+        "SELECT attachmentId, ownerId, role, mime, title, COALESCE(blobId, ''), utcDateScheduledForErasureSince \
+         FROM attachments WHERE ownerId = ?1 AND isDeleted = 0",
+    )?;
+    let attachments: Vec<(String, String, String, String, String, String, Option<String>)> = stmt
+        .query_map(params![branch.note_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (attachment_id, owner_id, role, mime, title, blob_id, scheduled) in attachments {
+        mark_attachment_deleted(conn, &attachment_id, &owner_id, &role, &mime, &title, &blob_id, scheduled.as_deref(), delete_id)?;
+    }
+
+    let note = load_note_any(conn, &branch.note_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    mark_note_deleted(conn, &note.note, delete_id)?;
+    Ok(true)
+}
+
+/// `DELETE /notes/{id}` — `note.deleteNote(deleteId)`: soft-delete the note and, through
+/// `deleteBranch`, its whole subtree under one `deleteId`. A note already deleted is a
+/// silent no-op; a missing one is a 404 (mirrors `becca.getNoteOrThrow`).
+pub fn delete_note(conn: &Connection, note_id: &str, delete_id: &str) -> Result<(), WriteError> {
+    let Some(row) = load_note_any(conn, note_id).map_err(WriteError::from)? else {
+        return Err(WriteError::not_found(note_id));
+    };
+    if row.is_deleted {
+        return Ok(());
+    }
+
+    let parent_branches: Vec<BranchState> = {
+        let mut stmt = conn.prepare(
+            "SELECT branchId, noteId, parentNoteId, prefix, isDeleted \
+             FROM branches WHERE noteId = ?1 AND isDeleted = 0",
+        )?;
+        let rows = stmt.query_map(params![note_id], branch_from_row)?;
+        let mut branches = Vec::new();
+        for row in rows {
+            branches.push(row?);
+        }
+        branches
+    };
+
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> rusqlite::Result<()> {
+        for branch in parent_branches {
+            delete_branch_recursively(conn, &branch, delete_id)?;
+        }
+        Ok(())
+    })();
+    match run {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::from(err))
+        }
+    }
+}
+
+/// Physical deletion of entity rows plus their entity changes marked as erased —
+/// `eraseNotes`/`eraseBranches`/… in `erase.ts`: the rows are dropped and the matching
+/// `entity_changes` rows keep their hash but flip `isErased` with a fresh change id so
+/// connected clients learn about the erasure.
+fn erase_entity_rows(conn: &Connection, table: &str, pk: &str, entity_name: &str, ids: &[String]) -> rusqlite::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    conn.execute(&format!("DELETE FROM {table} WHERE {pk} IN ({placeholders})"), rusqlite::params_from_iter(refs))?;
+    for id in ids {
+        conn.execute(
+            "UPDATE entity_changes SET isErased = 1, changeId = ?1, componentId = 'NA', instanceId = ?2, isSynced = 1, utcDateChanged = ?3 \
+             WHERE entityName = ?4 AND entityId = ?5",
+            params![random_string(12), instance_id(), utc_now(), entity_name, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// `eraseUnusedBlobs`: purge blobs no note/attachment/revision references any more.
+fn erase_unused_blobs(conn: &Connection) -> rusqlite::Result<()> {
+    let orphaned: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT b.blobId FROM blobs b \
+             LEFT JOIN notes n ON n.blobId = b.blobId \
+             LEFT JOIN attachments a ON a.blobId = b.blobId \
+             LEFT JOIN revisions r ON r.blobId = b.blobId \
+             WHERE n.noteId IS NULL AND a.attachmentId IS NULL AND r.revisionId IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out
+    };
+    for blob_id in orphaned {
+        conn.execute("DELETE FROM blobs WHERE blobId = ?1", params![blob_id])?;
+        conn.execute("DELETE FROM entity_changes WHERE entityName = 'blobs' AND entityId = ?1", params![blob_id])?;
+    }
+    Ok(())
+}
+
+/// `eraseNotesWithDeleteId`: after a `?eraseNotes=true` delete, physically erase every
+/// soft-deleted row stamped with the batch's `deleteId` (and the revisions of the erased
+/// notes), then purge now-unreferenced blobs.
+pub fn erase_notes_with_delete_id(conn: &Connection, delete_id: &str) -> rusqlite::Result<()> {
+    fn ids_for(conn: &Connection, sql: &str, arg: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![arg], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> rusqlite::Result<()> {
+        let note_ids = ids_for(conn, "SELECT noteId FROM notes WHERE isDeleted = 1 AND deleteId = ?1", delete_id)?;
+        erase_entity_rows(conn, "notes", "noteId", "notes", &note_ids)?;
+        if !note_ids.is_empty() {
+            let placeholders = note_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let refs: Vec<&str> = note_ids.iter().map(String::as_str).collect();
+            let mut stmt = conn.prepare(&format!("SELECT revisionId FROM revisions WHERE noteId IN ({placeholders})"))?;
+            let revision_ids: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(refs), |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            erase_entity_rows(conn, "revisions", "revisionId", "revisions", &revision_ids)?;
+        }
+        let branch_ids = ids_for(conn, "SELECT branchId FROM branches WHERE isDeleted = 1 AND deleteId = ?1", delete_id)?;
+        erase_entity_rows(conn, "branches", "branchId", "branches", &branch_ids)?;
+        let attribute_ids = ids_for(conn, "SELECT attributeId FROM attributes WHERE isDeleted = 1 AND deleteId = ?1", delete_id)?;
+        erase_entity_rows(conn, "attributes", "attributeId", "attributes", &attribute_ids)?;
+        let attachment_ids = ids_for(conn, "SELECT attachmentId FROM attachments WHERE isDeleted = 1 AND deleteId = ?1", delete_id)?;
+        erase_entity_rows(conn, "attachments", "attachmentId", "attachments", &attachment_ids)?;
+        erase_unused_blobs(conn)?;
+        Ok(())
+    })();
+    match run {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(err)
+        }
+    }
+}
+
+/// The outcome of an undelete, as the route's `UndeleteNoteResult` shape.
+pub struct UndeleteResult {
+    pub undeleted: bool,
+    pub restored_to_fallback_parent: bool,
+}
+
+/// `PUT /notes/{id}/undelete` — `noteService.undeleteNote`: restore a soft-deleted note
+/// through whichever of its original parents still lives; a note whose parents are all
+/// gone is only restorable under an explicit fallback parent. Returns whether anything
+/// was actually restored (an already-erased note cannot be).
+pub fn undelete_note(conn: &Connection, note_id: &str, fallback_parent_note_id: Option<&str>) -> Result<UndeleteResult, WriteError> {
+    let failed = UndeleteResult { undeleted: false, restored_to_fallback_parent: false };
+
+    let Some(row) = load_note_any(conn, note_id).map_err(WriteError::from)? else {
+        return Ok(failed); // erased in the meantime — nothing to restore
+    };
+    if !row.is_deleted {
+        return Ok(failed);
+    }
+    let Some(delete_id) = row.delete_id.clone() else {
+        return Ok(failed);
+    };
+
+    conn.execute_batch("BEGIN")?;
+    let run = (|| -> rusqlite::Result<UndeleteResult> {
+        // Original parents that still live: restore through them.
+        let mut stmt = conn.prepare(
+            "SELECT b.branchId FROM branches b JOIN notes p ON p.noteId = b.parentNoteId \
+             WHERE b.noteId = ?1 AND b.isDeleted = 1 AND b.deleteId = ?2 AND p.isDeleted = 0",
+        )?;
+        let branch_ids: Vec<String> = stmt
+            .query_map(params![note_id, delete_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !branch_ids.is_empty() {
+            for branch_id in &branch_ids {
+                undelete_branch(conn, branch_id, &delete_id)?;
+            }
+            return Ok(UndeleteResult { undeleted: true, restored_to_fallback_parent: false });
+        }
+
+        // Orphan: give it a new home under the fallback parent, if one was named and lives.
+        let Some(fallback) = fallback_parent_note_id else {
+            return Ok(failed);
+        };
+        if load_note(conn, fallback)?.is_none() {
+            return Ok(failed);
+        }
+        let branch_id = format!("{fallback}_{note_id}");
+        let position = note_position_for(conn, fallback)?;
+        let utc = utc_now();
+        conn.execute(
+            "INSERT INTO branches (branchId, noteId, parentNoteId, notePosition, prefix, isExpanded, isDeleted, deleteId, utcDateModified) \
+             VALUES (?1, ?2, ?3, ?4, '', 0, 0, NULL, ?5)",
+            params![branch_id, note_id, fallback, position, utc],
+        )?;
+        put_entity_change(conn, "branches", &branch_id, &branch_hash_value(&branch_id, note_id, fallback, Some(""), false), &utc)?;
+        restore_note_and_descendants(conn, note_id, &delete_id)?;
+        Ok(UndeleteResult { undeleted: true, restored_to_fallback_parent: true })
+    })();
+    match run {
+        Ok(result) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(result)
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            Err(WriteError::from(err))
+        }
+    }
+}
+
+/// `undeleteBranch`: restore one soft-deleted branch (skipped when its note was deleted in
+/// a different batch), recursing into the note's own subtree when it shares the deleteId.
+fn undelete_branch(conn: &Connection, branch_id: &str, delete_id: &str) -> rusqlite::Result<()> {
+    let Some(branch) = load_branch(conn, branch_id)? else {
+        return Ok(());
+    };
+    if !branch.is_deleted {
+        return Ok(());
+    }
+    let note_state = load_note_any(conn, &branch.note_id)?;
+    if let Some(note) = &note_state {
+        if note.is_deleted && note.delete_id.as_deref() != Some(delete_id) {
+            return Ok(());
+        }
+    }
+
+    conn.execute("UPDATE branches SET isDeleted = 0 WHERE branchId = ?1", params![branch.branch_id])?;
+    put_entity_change(conn, "branches", &branch.branch_id, &branch_hash_value(&branch.branch_id, &branch.note_id, &branch.parent_note_id, branch.prefix.as_deref(), false), &utc_now())?;
+
+    if let Some(note) = &note_state {
+        if note.is_deleted && note.delete_id.as_deref() == Some(delete_id) {
+            restore_note_and_descendants(conn, &branch.note_id, delete_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// `restoreNoteAndDescendants`: restore the note's row, the attributes and attachments
+/// deleted with it (matching the deleteId), then recurse into the child branches of the
+/// subtree. Each row keeps its stored values; only `isDeleted` flips back, which is
+/// exactly what `entity.save()` — a full upsert with `isDeleted: false` — does.
+fn restore_note_and_descendants(conn: &Connection, note_id: &str, delete_id: &str) -> rusqlite::Result<()> {
+    let Some(row) = load_note_any(conn, note_id)? else {
+        return Ok(());
+    };
+    conn.execute("UPDATE notes SET isDeleted = 0 WHERE noteId = ?1", params![note_id])?;
+    put_entity_change(conn, "notes", note_id, &note_hash(&row.note, false), &utc_now())?;
+
+    let mut stmt = conn.prepare(
+        "SELECT attributeId, noteId, type, name, value, isInheritable FROM attributes \
+         WHERE isDeleted = 1 AND deleteId = ?1 AND (noteId = ?2 OR (type = 'relation' AND value = ?2))",
+    )?;
+    let attrs: Vec<(String, String, String, String, String, i64)> = stmt
+        .query_map(params![delete_id, note_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (attribute_id, attr_note_id, attr_type, name, value, is_inheritable) in attrs {
+        conn.execute("UPDATE attributes SET isDeleted = 0 WHERE attributeId = ?1", params![attribute_id])?;
+        let hash = attribute_hash(&attribute_id, &attr_note_id, &attr_type, &name, &value, is_inheritable != 0, false);
+        put_entity_change(conn, "attributes", &attribute_id, &hash, &utc_now())?;
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT attachmentId, ownerId, role, mime, title, COALESCE(blobId, ''), utcDateScheduledForErasureSince \
+         FROM attachments WHERE isDeleted = 1 AND deleteId = ?1 AND ownerId = ?2",
+    )?;
+    let attachments: Vec<(String, String, String, String, String, String, Option<String>)> = stmt
+        .query_map(params![delete_id, note_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (attachment_id, owner_id, role, mime, title, blob_id, scheduled) in attachments {
+        conn.execute("UPDATE attachments SET isDeleted = 0 WHERE attachmentId = ?1", params![attachment_id])?;
+        let hash = attachment_hash_value(&attachment_id, &owner_id, &role, &mime, &title, &blob_id, scheduled.as_deref(), false);
+        put_entity_change(conn, "attachments", &attachment_id, &hash, &utc_now())?;
+    }
+
+    let mut stmt = conn.prepare("SELECT branchId FROM branches WHERE isDeleted = 1 AND deleteId = ?1 AND parentNoteId = ?2")?;
+    let child_ids: Vec<String> = stmt
+        .query_map(params![delete_id, note_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for branch_id in child_ids {
+        undelete_branch(conn, &branch_id, delete_id)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2650,7 +3536,10 @@ mod tests {
         // Convert: a new image note under the same parent, the attachment soft-deleted, and the
         // parent's content re-pointed at `api/images/{newNoteId}/`.
         let created = convert_attachment_to_note(&conn, &attachment_id).unwrap();
-        assert_eq!(created.parent_note_id, note_id);
+        let created_parent: String = conn
+            .query_row("SELECT parentNoteId FROM branches WHERE branchId = ?1", params![created.branch_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(created_parent, note_id);
         let (note_type, is_protected, new_blob): (String, i64, String) = conn
             .query_row(
                 "SELECT type, isProtected, blobId FROM notes WHERE noteId = ?1 AND isDeleted = 0",
@@ -2752,5 +3641,238 @@ mod tests {
             }
         }
         eprintln!("file-route verification passed for note {note_id}");
+    }
+
+    /// The full note lifecycle over a copy of a real database: create (with type/mime
+    /// derivation and an owned label), create *after* a sibling, rename, soft-delete
+    /// (subtree + attributes), undelete through the surviving parent, delete again and
+    /// erase — checking the rows and entity changes at each step.
+    #[test]
+    fn note_lifecycle_create_rename_delete_undelete_erase() {
+        let Ok(src) = std::env::var("TRILIUM_VERIFY_SOURCE") else {
+            eprintln!("TRILIUM_VERIFY_SOURCE not set; integration verification skipped");
+            return;
+        };
+        let conn = copy_db(&src);
+        let parent = pick_text_note(&conn);
+
+        // --- create into the parent (text type derived) with an owned label ---
+        let created = create_note_with_target(
+            &conn,
+            "into",
+            None,
+            NoteCreateParams {
+                parent_note_id: parent.clone(),
+                title: Some("Lifecycle note".to_string()),
+                note_type: None,
+                mime: None,
+                content: "<p>hello</p>".to_string(),
+                is_protected: false,
+                is_expanded: false,
+                prefix: None,
+                note_position: None,
+                note_id: None,
+                template_note_id: None,
+                attributes: vec![CreateAttribute {
+                    attr_type: "label".to_string(),
+                    name: "testLabel".to_string(),
+                    value: "v1".to_string(),
+                    is_inheritable: true,
+                }],
+                ignore_forbidden_parents: false,
+            },
+        )
+        .unwrap();
+
+        let (note_type, mime, stored_title): (String, String, String) = conn
+            .query_row(
+                "SELECT type, mime, title FROM notes WHERE noteId = ?1 AND isDeleted = 0",
+                params![created.note_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(note_type, "text", "type should be derived from the parent");
+        assert_eq!(mime, "text/html", "text type has the default HTML mime");
+        assert_eq!(stored_title, "Lifecycle note");
+        let content: String = conn
+            .query_row(
+                "SELECT b.content FROM blobs b JOIN notes n ON n.blobId = b.blobId WHERE n.noteId = ?1",
+                params![created.note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "<p>hello</p>", "creation content must be stored verbatim");
+        let branch_parent: String = conn
+            .query_row("SELECT parentNoteId FROM branches WHERE branchId = ?1", params![created.branch_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(branch_parent, parent);
+
+        // --- create after the sibling: position = sibling + 10 ---
+        let after = create_note_with_target(
+            &conn,
+            "after",
+            Some(&created.branch_id),
+            NoteCreateParams {
+                parent_note_id: parent.clone(),
+                title: Some("After sibling".to_string()),
+                note_type: None,
+                mime: None,
+                content: String::new(),
+                is_protected: false,
+                is_expanded: false,
+                prefix: None,
+                note_position: None,
+                note_id: None,
+                template_note_id: None,
+                attributes: Vec::new(),
+                ignore_forbidden_parents: false,
+            },
+        )
+        .unwrap();
+        let after_position: i64 = conn
+            .query_row("SELECT notePosition FROM branches WHERE branchId = ?1", params![after.branch_id], |r| r.get(0))
+            .unwrap();
+        let created_position: i64 = conn
+            .query_row("SELECT notePosition FROM branches WHERE branchId = ?1", params![created.branch_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after_position, created_position + 10, "after targets the sibling + 10");
+
+        // --- rename; a title change takes a revision snapshot first ---
+        change_note_title(&conn, &created.note_id, "Renamed").unwrap();
+        let stored_title: String = conn
+            .query_row("SELECT title FROM notes WHERE noteId = ?1 AND isDeleted = 0", params![created.note_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored_title, "Renamed");
+
+        // --- soft delete: note/branch/owned label all marked with the batch deleteId ---
+        let delete_id = "dv00000101";
+        delete_note(&conn, &created.note_id, delete_id).unwrap();
+        let (is_deleted, stored_delete_id): (i64, String) = conn
+            .query_row(
+                "SELECT isDeleted, deleteId FROM notes WHERE noteId = ?1",
+                params![created.note_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(is_deleted, 1);
+        assert_eq!(stored_delete_id, delete_id);
+        let branch_deleted: i64 = conn
+            .query_row("SELECT isDeleted FROM branches WHERE branchId = ?1", params![created.branch_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(branch_deleted, 1);
+        let label_deleted: i64 = conn
+            .query_row(
+                "SELECT isDeleted FROM attributes WHERE noteId = ?1 AND name = 'testLabel'",
+                params![created.note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(label_deleted, 1, "owned attributes are soft-deleted with the note");
+
+        // --- undelete through the surviving parent: note, branch and label back ---
+        let result = undelete_note(&conn, &created.note_id, None).unwrap();
+        assert!(result.undeleted);
+        assert!(!result.restored_to_fallback_parent);
+        let is_deleted: i64 = conn
+            .query_row("SELECT isDeleted FROM notes WHERE noteId = ?1", params![created.note_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(is_deleted, 0, "note must be restored");
+        let branch_deleted: i64 = conn
+            .query_row("SELECT isDeleted FROM branches WHERE branchId = ?1", params![created.branch_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(branch_deleted, 0, "branch must be restored");
+        let label_deleted: i64 = conn
+            .query_row(
+                "SELECT isDeleted FROM attributes WHERE noteId = ?1 AND name = 'testLabel'",
+                params![created.note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(label_deleted, 0, "owned label must be restored");
+        let note_change_hash: String = conn
+            .query_row(
+                "SELECT hash FROM entity_changes WHERE entityName = 'notes' AND entityId = ?1 AND isErased = 0",
+                params![created.note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!note_change_hash.ends_with("|deleted") && !note_change_hash.contains("deleted"), "restored change hash must be the live one");
+
+        // --- delete with erase: rows physically gone, entity changes flipped to erased ---
+        delete_note(&conn, &created.note_id, delete_id).unwrap();
+        delete_note(&conn, &after.note_id, delete_id).unwrap();
+        erase_notes_with_delete_id(&conn, delete_id).unwrap();
+        let note_rows: i64 = conn.query_row("SELECT COUNT(*) FROM notes WHERE noteId = ?1", params![created.note_id], |r| r.get(0)).unwrap();
+        assert_eq!(note_rows, 0, "erased note rows are gone");
+        let branch_rows: i64 = conn.query_row("SELECT COUNT(*) FROM branches WHERE branchId = ?1", params![created.branch_id], |r| r.get(0)).unwrap();
+        assert_eq!(branch_rows, 0, "erased branch rows are gone");
+        let erased: i64 = conn
+            .query_row(
+                "SELECT isErased FROM entity_changes WHERE entityName = 'notes' AND entityId = ?1",
+                params![created.note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(erased, 1, "the note's entity change must be marked erased");
+
+        // An orphaned note (parent deleted too) can only be restored under a fallback parent.
+        let orphan = create_note_with_target(
+            &conn,
+            "into",
+            None,
+            NoteCreateParams {
+                parent_note_id: parent.clone(),
+                title: Some("Orphan".to_string()),
+                note_type: None,
+                mime: None,
+                content: String::new(),
+                is_protected: false,
+                is_expanded: false,
+                prefix: None,
+                note_position: None,
+                note_id: None,
+                template_note_id: None,
+                attributes: Vec::new(),
+                ignore_forbidden_parents: false,
+            },
+        )
+        .unwrap();
+        delete_note(&conn, &orphan.note_id, "dv00000102").unwrap();
+        // First delete the orphan's parent, so no live parent branch exists for it.
+        let fallback = create_note_with_target(
+            &conn,
+            "into",
+            None,
+            NoteCreateParams {
+                parent_note_id: parent.clone(),
+                title: Some("Fallback home".to_string()),
+                note_type: None,
+                mime: None,
+                content: String::new(),
+                is_protected: false,
+                is_expanded: false,
+                prefix: None,
+                note_position: None,
+                note_id: None,
+                template_note_id: None,
+                attributes: Vec::new(),
+                ignore_forbidden_parents: false,
+            },
+        )
+        .unwrap();
+        delete_note(&conn, &fallback.note_id, "dv00000103").unwrap();
+        delete_note(&conn, &orphan.note_id, "dv00000102").unwrap();
+        let result = undelete_note(&conn, &orphan.note_id, Some(&fallback.note_id)).unwrap();
+        assert!(result.undeleted, "orphan should be restorable under the fallback parent");
+        assert!(result.restored_to_fallback_parent, "the fallback parent reattachment must be reported");
+        let orphan_home: String = conn
+            .query_row("SELECT parentNoteId FROM branches WHERE noteId = ?1 AND isDeleted = 0", params![orphan.note_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphan_home, fallback.note_id, "orphan must be reattached under the fallback");
+
+        eprintln!(
+            "note-lifecycle verification passed (note {}, after-sibling {}, orphan {})",
+            created.note_id, after.note_id, orphan.note_id
+        );
     }
 }
